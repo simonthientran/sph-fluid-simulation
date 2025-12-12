@@ -108,6 +108,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib.patches import Rectangle
+from matplotlib.colors import TwoSlopeNorm
 
 import json
 import time
@@ -115,8 +116,13 @@ import time
 from sph_sim.core.particles import initialize_particles_cube
 from sph_sim.core.kernels import poly6_kernel
 from sph_sim.core.density import compute_density_naive
-from sph_sim.core.density_grid import compute_density_grid
+from sph_sim.core.pressure import compute_pressure_eos
 from sph_sim.core.neighbor_search import build_uniform_grid, query_neighbor_candidates
+
+try:
+    from sph_sim.core.density_grid import compute_density_grid
+except Exception:
+    compute_density_grid = None
 
 
 def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
@@ -1122,6 +1128,7 @@ def plot_density(ax, x, y, rho, focus_index: int, h: float) -> None:
     text = (
         f"rho min = {rho_min:.6g}\n"
         f"rho max = {rho_max:.6g}\n\n"
+        "Density is computed from neighboring particles via the kernel\n\n"
         "SPH-Dichte:\n"
         "rho_i = Σ_j m_j · W(r_ij, h)"
     )
@@ -1137,7 +1144,7 @@ def plot_density(ax, x, y, rho, focus_index: int, h: float) -> None:
     )
 
     ax.set_aspect("equal", adjustable="box")
-    ax.set_title("Naive SPH-Dichte (Farbe) + Fokus + Radius h")
+    ax.set_title("SPH-Dichte (Farbe) + Fokus + Radius h")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.grid(True, alpha=0.3)
@@ -1279,6 +1286,30 @@ def run_learning_viz(
     _validate_positive("rho0", rho0)
     _validate_positive("mass_per_particle", mass_per_particle)
     _validate_positive("h", h)
+
+    # --- Deutsch ---
+    # Demo-Defaults (warum gerade dx=0.1 und h=1.5*dx?):
+    # - dx=0.1 → genügend Partikel (bei L=1.0 sind es typischerweise 10×10 = 100), also kein 2×2-Grid.
+    # - h=1.5*dx (bei den Defaults: 0.15) → jeder Partikel hat mehrere Nachbarn im Einflussradius,
+    #   dadurch entstehen sichtbare Dichteunterschiede (Rand vs. Innen) statt "alles gleich".
+    #
+    # --- English ---
+    # Demo defaults (why dx=0.1 and h=1.5*dx?):
+    # - dx=0.1 → enough particles (for L=1.0 this is typically 10×10 = 100), i.e. not a 2×2 grid.
+    # - h=1.5*dx (for the defaults: 0.15) → each particle has multiple neighbors within the influence radius,
+    #   which yields visible density differences (boundary vs interior) instead of "everything equal".
+
+    # --- Deutsch ---
+    # Demo-Defaults (didaktisch):
+    # - dx klein → viele Partikel → es gibt "Innen" und "Rand" → Dichteunterschiede werden sichtbar.
+    # - h etwas größer als dx (hier: h ≈ 1.5*dx) → mehr Nachbarn tragen zur Dichte bei,
+    #   dadurch entstehen stärkere und glattere Dichtevariationen.
+    #
+    # --- English ---
+    # Demo defaults (teaching):
+    # - small dx → many particles → we get "interior" and "boundary" → density differences become visible.
+    # - h slightly larger than dx (here: h ≈ 1.5*dx) → more neighbors contribute to density,
+    #   which creates stronger and smoother density variations.
 
     # --- Deutsch ---
     # Eine sehr einfache Plausibilitätsprüfung:
@@ -1436,29 +1467,170 @@ def run_learning_viz(
     num_true_neighbors = len(true_neighbors_excluding_focus)
 
     # --- Deutsch ---
-    # --- Dichte berechnen (naiv, O(N^2)) -------------------------------------
+    # -------------------------------------------------------------------------
+    # Dichte für die Visualisierung korrekt berechnen und verwenden
+    # -------------------------------------------------------------------------
+    # WICHTIG:
+    # - `particles.rho` enthält nur Initialwerte (rho0) und ist keine berechnete SPH-Dichte.
+    # - Für Plots dürfen wir daher NICHT `particles.rho` nutzen.
+    # - Wir berechnen die Dichte explizit mit SPH:
+    #   bevorzugt grid-basiert, sonst naiv.
     #
     # --- English ---
-    # --- Compute density (naive, O(N^2)) --------------------------------------
-    rho = compute_density_naive(particles=particles, h=h)
+    # -------------------------------------------------------------------------
+    # Correctly compute and use density for visualization
+    # -------------------------------------------------------------------------
+    # IMPORTANT:
+    # - `particles.rho` contains only initial values (rho0) and is not a computed SPH density.
+    # - Therefore we must NOT use `particles.rho` for plots.
+    # - We compute density explicitly via SPH:
+    #   prefer grid-based, otherwise naive.
+    if compute_density_grid is not None:
+        rho_grid = compute_density_grid(particles=particles, h=h, cell_size=h)
+        rho = rho_grid
+    else:
+        rho_grid = None
+        rho = compute_density_naive(particles=particles, h=h)
 
     # --- Deutsch ---
-    # Zusätzlich: Dichte auch mit Grid-Variante berechnen.
-    #
-    # Wichtig:
-    # - Physik ist identisch (gleiche Formel).
-    # - Nur die Nachbarsuche ist anders (weniger Kandidaten werden geprüft).
+    # Zusätzlich (Vergleich / Debug):
+    # - Wir berechnen auch die naive Referenzdichte.
+    # - Damit können wir Unterschiede visualisieren und zeigen: gleiche Physik, andere Nachbarsuche.
     #
     # --- English ---
-    # Additionally: compute density with the grid variant as well.
+    # Additionally (comparison / debug):
+    # - We also compute the naive reference density.
+    # - This lets us visualize differences and show: same physics, different neighbor search.
+    rho_naive = compute_density_naive(particles=particles, h=h)
+    if rho_grid is not None:
+        rho_diff_abs = np.abs(rho_naive - rho_grid)
+        rho_diff_abs_max = float(np.max(rho_diff_abs))
+    else:
+        rho_diff_abs = np.abs(rho_naive - rho_naive)
+        rho_diff_abs_max = float(np.max(rho_diff_abs))
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Demo-Referenzdichte (nur Visualisierung)
+    # -------------------------------------------------------------------------
+    # Problem im Lern-Demo:
+    # - Unsere "berechnete" SPH-Dichte rho (Kernel-Summe) ist in diesem Projekt nicht automatisch
+    #   so skaliert, dass sie exakt um rho0=1000.0 liegt.
+    # - Wenn wir trotzdem rho0=1000.0 direkt in eine EOS stecken, ergibt sich oft:
+    #     rho - rho0 < 0  → Druck wäre überwiegend negativ.
+    #
+    # Lösung für anschauliche Visualisierung:
+    # - Wir definieren einen Demo-Referenzwert rho0_demo als Mittelwert der berechneten Dichte.
+    # - Dieser Wert ist NUR für Visualisierung/Debugging gedacht, damit wir relative Unterschiede sehen.
+    # - Eine "echte" Simulation nutzt später rho0 aus Configs/Units und kalibriert Massen/Kernel entsprechend.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Demo reference density (visualization only)
+    # -------------------------------------------------------------------------
+    # Problem in this learning demo:
+    # - Our "computed" SPH density rho (kernel sum) is not automatically scaled in this project
+    #   to lie around rho0=1000.0.
+    # - If we still plug rho0=1000.0 directly into an EOS, we often get:
+    #     rho - rho0 < 0  → pressure is mostly negative.
+    #
+    # Solution for an intuitive visualization:
+    # - We define a demo reference value rho0_demo as the mean of the computed density.
+    # - This value is ONLY for visualization/debugging so we can see relative differences.
+    # - A "real" simulation later uses rho0 from configs/units and calibrates masses/kernel accordingly.
+    rho0_demo = float(np.mean(rho))
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Druck über EOS (Equation of State) berechnen
+    # -------------------------------------------------------------------------
+    # Wir berechnen Druck aus Dichte über eine einfache EOS (p = k*(rho - rho0)).
+    #
+    # Wichtig:
+    # - Das ist weiterhin nur "Zustand": p wird aus rho berechnet.
+    # - Die Physik-Kräfte (Druckkräfte) kommen erst in einem späteren Modul.
+    #
+    # Didaktik:
+    # - p hängt DIREKT von (rho - rho0) ab.
+    # - Darum ist drho = (rho - rho0) eine sehr direkte Visualisierung für "warum" Druck entsteht.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Compute pressure via EOS (equation of state)
+    # -------------------------------------------------------------------------
+    # We compute pressure from density via a simple EOS (p = k*(rho - rho0)).
     #
     # Important:
-    # - Physics is identical (same formula).
-    # - Only the neighbor search differs (fewer candidates are checked).
-    rho_naive = rho
-    rho_grid = compute_density_grid(particles=particles, h=h, cell_size=cell_size)
-    rho_diff_abs = np.abs(rho_naive - rho_grid)
-    rho_diff_abs_max = float(np.max(rho_diff_abs))
+    # - This is still only "state": p is computed from rho.
+    # - Pressure forces come later in a separate module.
+    #
+    # Teaching:
+    # - p depends DIRECTLY on (rho - rho0).
+    # - Therefore drho = (rho - rho0) is a very direct visualization of "why" pressure appears.
+    rho_for_pressure = rho
+
+    # --- Deutsch ---
+    # EOS-Parameter k:
+    # - Wir halten k als Demo-Parameter bewusst einfach.
+    # - Es ist KEINE neue Physik, nur eine Skalierung der Druckwerte für die Visualisierung.
+    #
+    # --- English ---
+    # EOS parameter k:
+    # - We keep k as a simple demo parameter.
+    # - This is NOT new physics, only a scaling of pressure values for visualization.
+    k = 2.0
+
+    # --- Deutsch ---
+    # Physikalischer Druck (lesbar gemacht durch Clamping):
+    # - Gleiche EOS wie in der Simulation, aber negative Werte werden auf 0 gesetzt,
+    #   damit Anfänger im Farbbild "wo ist Druck?" leichter erkennen.
+    #
+    # --- English ---
+    # Physical pressure (made readable via clamping):
+    # - Same EOS as in the simulation, but negative values are clamped to 0
+    #   so beginners can more easily see "where is pressure?" in the color plot.
+    p_phys = compute_pressure_eos(rho=rho_for_pressure, rho0=float(rho0), k=float(k), clamp_negative=True)
+
+    # --- Deutsch ---
+    # Demo-Druck (anschaulich):
+    # - Wir nutzen rho0_demo als Referenz, damit Druckunterschiede um den Mittelwert sichtbar werden.
+    # - Auch hier clampen wir, damit die Darstellung für Anfänger intuitiv bleibt.
+    #
+    # --- English ---
+    # Demo pressure (intuitive):
+    # - We use rho0_demo as reference so pressure differences around the mean become visible.
+    # - We clamp here as well so the visualization remains intuitive for beginners.
+    p_demo = compute_pressure_eos(rho=rho_for_pressure, rho0=float(rho0_demo), k=float(k), clamp_negative=True)
+
+    # --- Deutsch ---
+    # Zusätzlich: Demo-Druck OHNE Clamping (nur Darstellung).
+    #
+    # Warum?
+    # - Wir wollen explizit zeigen: niedrige Dichte (rho < rho0_demo) → negativer Druck.
+    # - Für Anfänger ist das als "Kontrast" sehr lehrreich (Rand/Ecken vs. Innen).
+    #
+    # Wichtig:
+    # - Das ändert keine Core-Physik, weil es nur die Visualisierung betrifft.
+    #
+    # --- English ---
+    # Additionally: demo pressure WITHOUT clamping (visualization only).
+    #
+    # Why?
+    # - We explicitly want to show: low density (rho < rho0_demo) → negative pressure.
+    # - For beginners this contrast is very instructive (boundary/corners vs interior).
+    #
+    # Important:
+    # - This does not change core physics because it is visualization-only.
+    p_demo_raw = compute_pressure_eos(rho=rho_for_pressure, rho0=float(rho0_demo), k=float(k), clamp_negative=False)
+
+    # --- Deutsch ---
+    # Dichteabweichung (kann positiv/negativ sein):
+    # - drho ist direkt der "Input" der EOS (bis auf den Faktor k).
+    #
+    # --- English ---
+    # Density deviation (can be positive/negative):
+    # - drho is directly the "input" to the EOS (up to the factor k).
+    drho = rho_for_pressure - float(rho0_demo)
 
     # --- Deutsch ---
     # --- Figure mit 3 Subplots ------------------------------------------------
@@ -1671,7 +1843,7 @@ def run_learning_viz(
         axs_cmp[1],
         particles.x,
         particles.y,
-        rho_grid,
+        rho_grid if rho_grid is not None else rho_naive,
         title="Plot B: grid rho",
         cbar_label="rho",
         cmap="viridis",
@@ -1687,8 +1859,8 @@ def run_learning_viz(
         0.02,
         0.98,
         "min(rho) = {mn}\nmax(rho) = {mx}".format(
-            mn=f"{float(np.min(rho_grid)):.12g}",
-            mx=f"{float(np.max(rho_grid)):.12g}",
+            mn=f"{float(np.min(rho_grid if rho_grid is not None else rho_naive)):.12g}",
+            mx=f"{float(np.max(rho_grid if rho_grid is not None else rho_naive)):.12g}",
         ),
         transform=axs_cmp[1].transAxes,
         ha="left",
@@ -1722,6 +1894,287 @@ def run_learning_viz(
 
     fig_cmp.suptitle("SPH Density Comparison: naive vs grid", fontsize=14, y=0.98)
     fig_cmp.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Zusätzliche Demo-Figure: rho, p_demo und drho als Farben (anschaulich)
+    # -------------------------------------------------------------------------
+    # Ziel:
+    # - Ein Plot zeigt Dichte rho als Farbe.
+    # - Ein Plot zeigt Demo-Druck p_demo als Farbe (clamped, nur positive Werte).
+    # - Ein Plot zeigt drho = rho - mean(rho) als Farbe (positiv/negativ).
+    #
+    # Wichtig:
+    # - Das ist nur Darstellung/Didaktik. Keine neue Physik.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Additional demo figure: rho, p_demo and drho as colors (intuitive)
+    # -------------------------------------------------------------------------
+    # Goal:
+    # - One plot shows density rho as color.
+    # - One plot shows demo pressure p_demo as color (clamped, positive values only).
+    # - One plot shows drho = rho - mean(rho) as color (positive/negative).
+    #
+    # Important:
+    # - This is visualization/teaching only. No new physics.
+    fig_demo, axs_demo = plt.subplots(1, 3, figsize=(18, 6))
+
+    plot_scalar_field(
+        axs_demo[0],
+        particles.x,
+        particles.y,
+        rho,
+        title="Density rho (color)",
+        cbar_label="density rho",
+        cmap="viridis",
+        focus_index=focus_index,
+        h=h,
+    )
+    axs_demo[0].text(
+        0.02,
+        0.98,
+        "min(rho) = {mn}\nmax(rho) = {mx}\n\nDensity is computed from neighboring particles via the kernel\n\nrho0_demo = {r0}\nk = {k}".format(
+            mn=f"{float(np.min(rho)):.12g}",
+            mx=f"{float(np.max(rho)):.12g}",
+            r0=f"{float(rho0_demo):.12g}",
+            k=f"{float(k):.12g}",
+        ),
+        transform=axs_demo[0].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    # --- Deutsch ---
+    # p_demo_raw kann positiv/negativ sein → divergierende Farbskala, zentriert bei 0.
+    #
+    # --- English ---
+    # p_demo_raw can be positive/negative → diverging colormap centered at 0.
+    p_abs_max = float(np.max(np.abs(p_demo_raw))) if p_demo_raw.size > 0 else 0.0
+    norm_p = TwoSlopeNorm(vcenter=0.0, vmin=-p_abs_max, vmax=p_abs_max)
+    sc_p = axs_demo[1].scatter(particles.x, particles.y, c=p_demo_raw, s=45, cmap="coolwarm", norm=norm_p)
+    cbar_p = fig_demo.colorbar(sc_p, ax=axs_demo[1])
+    cbar_p.set_label("demo pressure p_demo (unclamped)")
+    axs_demo[1].set_aspect("equal", adjustable="box")
+    axs_demo[1].set_title("Demo pressure p_demo (color, unclamped)")
+    axs_demo[1].set_xlabel("x")
+    axs_demo[1].set_ylabel("y")
+    axs_demo[1].grid(True, alpha=0.3)
+    axs_demo[1].scatter(
+        [particles.x[int(focus_index)]],
+        [particles.y[int(focus_index)]],
+        s=140,
+        c="tab:red",
+        marker="*",
+        zorder=5,
+    )
+    circle_p = Circle(
+        (float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])),
+        radius=float(h),
+        fill=False,
+        color="tab:red",
+        linewidth=1.8,
+        alpha=0.75,
+        zorder=4,
+    )
+    axs_demo[1].add_patch(circle_p)
+    axs_demo[1].text(
+        0.02,
+        0.98,
+        "min(p_demo_raw) = {mn}\nmax(p_demo_raw) = {mx}\n\nPressure reacts to density deviation from rho0\n\nrho0_demo = {r0}\nk = {k}".format(
+            mn=f"{float(np.min(p_demo_raw)):.12g}",
+            mx=f"{float(np.max(p_demo_raw)):.12g}",
+            r0=f"{float(rho0_demo):.12g}",
+            k=f"{float(k):.12g}",
+        ),
+        transform=axs_demo[1].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    # --- Deutsch ---
+    # drho ist positiv und negativ → wir nehmen eine divergierende Farbskala und zentrieren bei 0.
+    #
+    # --- English ---
+    # drho can be positive/negative → we use a diverging colormap centered at 0.
+    drho_abs_max = float(np.max(np.abs(drho))) if drho.size > 0 else 0.0
+    norm_drho = TwoSlopeNorm(vcenter=0.0, vmin=-drho_abs_max, vmax=drho_abs_max)
+    sc_drho = axs_demo[2].scatter(particles.x, particles.y, c=drho, s=45, cmap="coolwarm", norm=norm_drho)
+    cbar_drho = fig_demo.colorbar(sc_drho, ax=axs_demo[2])
+    cbar_drho.set_label("density deviation drho = rho - mean(rho)")
+    axs_demo[2].set_aspect("equal", adjustable="box")
+    axs_demo[2].set_title("Density deviation drho (color)")
+    axs_demo[2].set_xlabel("x")
+    axs_demo[2].set_ylabel("y")
+    axs_demo[2].grid(True, alpha=0.3)
+    axs_demo[2].scatter(
+        [particles.x[int(focus_index)]],
+        [particles.y[int(focus_index)]],
+        s=140,
+        c="tab:red",
+        marker="*",
+        zorder=5,
+    )
+    circle_drho = Circle(
+        (float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])),
+        radius=float(h),
+        fill=False,
+        color="tab:red",
+        linewidth=1.8,
+        alpha=0.75,
+        zorder=4,
+    )
+    axs_demo[2].add_patch(circle_drho)
+    axs_demo[2].text(
+        0.02,
+        0.98,
+        "min(drho) = {mn}\nmax(drho) = {mx}\n\nrho0_demo = {r0}\nk = {k}".format(
+            mn=f"{float(np.min(drho)):.12g}",
+            mx=f"{float(np.max(drho)):.12g}",
+            r0=f"{float(rho0_demo):.12g}",
+            k=f"{float(k):.12g}",
+        ),
+        transform=axs_demo[2].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    # --- Deutsch ---
+    # Fokus-Info (kleine, direkte Zahlenwerte) als zusätzliche Textbox "beim Fokus-Partikel":
+    # - rho_focus
+    # - p_demo_focus
+    # - drho_focus
+    #
+    # --- English ---
+    # Focus info (small, direct numeric values) as an additional textbox "near the focus particle":
+    # - rho_focus
+    # - p_demo_focus
+    # - drho_focus
+    rho_focus = float(rho_for_pressure[int(focus_index)])
+    p_demo_focus = float(p_demo_raw[int(focus_index)])
+    drho_focus = float(drho[int(focus_index)])
+    axs_demo[0].annotate(
+        "rho_focus = {r}\n"
+        "p_demo_focus = {p}\n"
+        "drho_focus = {d}".format(r=f"{rho_focus:.12g}", p=f"{p_demo_focus:.12g}", d=f"{drho_focus:.12g}"),
+        xy=(float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])),
+        xytext=(12, 12),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        arrowprops={"arrowstyle": "->", "color": "tab:red", "alpha": 0.6, "linewidth": 1.0},
+    )
+
+    fig_demo.suptitle("SPH Demo: density, demo pressure, density deviation", fontsize=14, y=0.98)
+    fig_demo.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Zusätzliche Pressure-Figure: Druck sichtbar machen + EOS-Beziehung zeigen
+    # -------------------------------------------------------------------------
+    # Panel 1: Druck p als Farbe auf den Partikeln (Colorbar "pressure p").
+    # Panel 2: Zusammenhang rho → p als Scatter (x=rho, y=p).
+    #
+    # Textbox:
+    # - verwendete Parameter rho0 und k
+    # - kurzer Satz: "EOS maps density error to pressure"
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Additional pressure figure: visualize pressure + show EOS relation
+    # -------------------------------------------------------------------------
+    # Panel 1: pressure p as color on particles (colorbar "pressure p").
+    # Panel 2: relation rho → p as a scatter (x=rho, y=p).
+    #
+    # Textbox:
+    # - used parameters rho0 and k
+    # - short sentence: "EOS maps density error to pressure"
+    fig_p, axs_p = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- Deutsch ---
+    # Für die EOS-Plot-Figure zeigen wir den un-geclamp-ten Demo-Druck,
+    # damit negative Werte (bei niedriger Dichte) sichtbar sind.
+    #
+    # --- English ---
+    # For the EOS plot figure we show the unclamped demo pressure
+    # so negative values (at low density) become visible.
+    p_abs_max2 = float(np.max(np.abs(p_demo_raw))) if p_demo_raw.size > 0 else 0.0
+    norm_p2 = TwoSlopeNorm(vcenter=0.0, vmin=-p_abs_max2, vmax=p_abs_max2)
+    sc_p2 = axs_p[0].scatter(particles.x, particles.y, c=p_demo_raw, s=45, cmap="coolwarm", norm=norm_p2)
+    cbar_p2 = fig_p.colorbar(sc_p2, ax=axs_p[0])
+    cbar_p2.set_label("pressure p (demo, unclamped)")
+    axs_p[0].set_aspect("equal", adjustable="box")
+    axs_p[0].set_title("Pressure p (color, demo, unclamped)")
+    axs_p[0].set_xlabel("x")
+    axs_p[0].set_ylabel("y")
+    axs_p[0].grid(True, alpha=0.3)
+    axs_p[0].scatter(
+        [particles.x[int(focus_index)]],
+        [particles.y[int(focus_index)]],
+        s=140,
+        c="tab:red",
+        marker="*",
+        zorder=5,
+    )
+    circle_p2 = Circle(
+        (float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])),
+        radius=float(h),
+        fill=False,
+        color="tab:red",
+        linewidth=1.8,
+        alpha=0.75,
+        zorder=4,
+    )
+    axs_p[0].add_patch(circle_p2)
+    axs_p[0].text(
+        0.02,
+        0.98,
+        "min(p_demo_raw) = {mn}\nmax(p_demo_raw) = {mx}\n\nPressure reacts to density deviation from rho0".format(
+            mn=f"{float(np.min(p_demo_raw)):.12g}",
+            mx=f"{float(np.max(p_demo_raw)):.12g}",
+        ),
+        transform=axs_p[0].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    # --- Deutsch ---
+    # Scatter: jedes Partikel ist ein Punkt (rho_i, p_i).
+    #
+    # --- English ---
+    # Scatter: each particle is one point (rho_i, p_i).
+    axs_p[1].scatter(rho_for_pressure, p_demo_raw, s=35, alpha=0.85, color="tab:blue")
+    axs_p[1].set_title("EOS: rho → p")
+    axs_p[1].set_xlabel("rho")
+    axs_p[1].set_ylabel("pressure p")
+    axs_p[1].grid(True, alpha=0.3)
+
+    axs_p[1].text(
+        0.02,
+        0.98,
+        "rho0 = {rho0}\n"
+        "k = {k}\n\n"
+        "EOS maps density error to pressure".format(rho0=f"{float(rho0):.12g}", k=f"{float(k):.12g}"),
+        transform=axs_p[1].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    fig_p.suptitle("SPH Pressure via EOS", fontsize=14, y=0.98)
+    fig_p.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
+
 
     # --- Deutsch ---
     # Anzeigen (kein File-I/O, keine Prints)
