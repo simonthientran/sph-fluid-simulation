@@ -115,6 +115,7 @@ import time
 from sph_sim.core.particles import initialize_particles_cube
 from sph_sim.core.kernels import poly6_kernel
 from sph_sim.core.density import compute_density_naive
+from sph_sim.core.density_grid import compute_density_grid
 from sph_sim.core.neighbor_search import build_uniform_grid, query_neighbor_candidates
 
 
@@ -1143,6 +1144,89 @@ def plot_density(ax, x, y, rho, focus_index: int, h: float) -> None:
     ax.legend(loc="lower right")
 
 
+def plot_scalar_field(
+    ax,
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    *,
+    title: str,
+    cbar_label: str,
+    cmap: str = "viridis",
+    focus_index: int | None = None,
+    h: float | None = None,
+) -> None:
+    """
+    DE:
+    Plot: Skalarfeld pro Partikel als Farbe (z.B. rho oder |Δrho|).
+
+    Warum diese Extra-Funktion?
+    - `plot_density(...)` ist sehr didaktisch und enthält absichtlich Textbox + Formel.
+    - Für Vergleiche (naiv vs grid vs Differenz) wollen wir aber eine ruhigere Darstellung:
+      gleiche Achsen, gleiche Marker, nur andere Farben.
+
+    Optional:
+    - Wenn focus_index und h gegeben sind, zeichnen wir Fokus + Kreis h als Orientierung.
+
+    EN:
+    Plot: scalar field per particle as color (e.g., rho or |Δrho|).
+
+    Why this extra function?
+    - `plot_density(...)` is very didactic and intentionally includes a textbox + formula.
+    - For comparisons (naive vs grid vs difference) we want a calmer visualization:
+      same axes, same markers, only different colors.
+
+    Optional:
+    - If focus_index and h are provided, we draw focus + h circle as orientation.
+    """
+
+    # --- Deutsch ---
+    # Scatter: jeder Partikel bekommt eine Farbe entsprechend `values[i]`.
+    #
+    # --- English ---
+    # Scatter: each particle gets a color according to `values[i]`.
+    sc = ax.scatter(x, y, c=values, s=45, cmap=cmap)
+
+    # --- Deutsch ---
+    # Colorbar: erklärt die Farbskala.
+    #
+    # --- English ---
+    # Colorbar: explains the color scale.
+    cbar = ax.figure.colorbar(sc, ax=ax)
+    cbar.set_label(cbar_label)
+
+    # --- Deutsch ---
+    # Optional: Fokus + Kreis h als Orientierung (keine zusätzliche Physik).
+    #
+    # --- English ---
+    # Optional: focus + h circle as orientation (no additional physics).
+    if focus_index is not None and h is not None:
+        ax.scatter(
+            [x[int(focus_index)]],
+            [y[int(focus_index)]],
+            s=140,
+            c="tab:red",
+            marker="*",
+            zorder=5,
+        )
+        circle = Circle(
+            (float(x[int(focus_index)]), float(y[int(focus_index)])),
+            radius=float(h),
+            fill=False,
+            color="tab:red",
+            linewidth=1.8,
+            alpha=0.75,
+            zorder=4,
+        )
+        ax.add_patch(circle)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.grid(True, alpha=0.3)
+
+
 def run_learning_viz(
     L: float = 1.0,
     dx: float = 0.1,
@@ -1359,6 +1443,24 @@ def run_learning_viz(
     rho = compute_density_naive(particles=particles, h=h)
 
     # --- Deutsch ---
+    # Zusätzlich: Dichte auch mit Grid-Variante berechnen.
+    #
+    # Wichtig:
+    # - Physik ist identisch (gleiche Formel).
+    # - Nur die Nachbarsuche ist anders (weniger Kandidaten werden geprüft).
+    #
+    # --- English ---
+    # Additionally: compute density with the grid variant as well.
+    #
+    # Important:
+    # - Physics is identical (same formula).
+    # - Only the neighbor search differs (fewer candidates are checked).
+    rho_naive = rho
+    rho_grid = compute_density_grid(particles=particles, h=h, cell_size=cell_size)
+    rho_diff_abs = np.abs(rho_naive - rho_grid)
+    rho_diff_abs_max = float(np.max(rho_diff_abs))
+
+    # --- Deutsch ---
     # --- Figure mit 3 Subplots ------------------------------------------------
     #
     # --- English ---
@@ -1503,6 +1605,123 @@ def run_learning_viz(
         },
     )
     # endregion agent log
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Zusätzliche Vergleichs-Figure: naive vs grid vs |Δrho|
+    # -------------------------------------------------------------------------
+    # Wir entfernen nichts am bestehenden Lern-Plot.
+    # Stattdessen erstellen wir eine zweite Figure, die nur den Dichtevergleich zeigt.
+    #
+    # Plot A: naive rho
+    # Plot B: grid rho
+    # Plot C: |rho_naive − rho_grid|
+    #
+    # In Plot C zeigen wir eine Textbox:
+    # - max(|Δρ|)
+    # - kurzer Merksatz: "Same physics, fewer neighbor checks"
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Additional comparison figure: naive vs grid vs |Δrho|
+    # -------------------------------------------------------------------------
+    # We do not remove anything from the existing learning plot.
+    # Instead we create a second figure that focuses only on the density comparison.
+    #
+    # Plot A: naive rho
+    # Plot B: grid rho
+    # Plot C: |rho_naive − rho_grid|
+    #
+    # In plot C we show a textbox:
+    # - max(|Δρ|)
+    # - short takeaway: "Same physics, fewer neighbor checks"
+    fig_cmp, axs_cmp = plt.subplots(1, 3, figsize=(18, 6))
+
+    plot_scalar_field(
+        axs_cmp[0],
+        particles.x,
+        particles.y,
+        rho_naive,
+        title="Plot A: naive rho",
+        cbar_label="rho",
+        cmap="viridis",
+        focus_index=focus_index,
+        h=h,
+    )
+    # --- Deutsch ---
+    # Zusätzliche Zahlenangabe: min/max der Dichte (naiv) direkt als Textbox.
+    #
+    # --- English ---
+    # Additional numeric annotation: min/max density (naive) as a textbox.
+    axs_cmp[0].text(
+        0.02,
+        0.98,
+        "min(rho) = {mn}\nmax(rho) = {mx}".format(
+            mn=f"{float(np.min(rho_naive)):.12g}",
+            mx=f"{float(np.max(rho_naive)):.12g}",
+        ),
+        transform=axs_cmp[0].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    plot_scalar_field(
+        axs_cmp[1],
+        particles.x,
+        particles.y,
+        rho_grid,
+        title="Plot B: grid rho",
+        cbar_label="rho",
+        cmap="viridis",
+        focus_index=focus_index,
+        h=h,
+    )
+    # --- Deutsch ---
+    # Zusätzliche Zahlenangabe: min/max der Dichte (grid) direkt als Textbox.
+    #
+    # --- English ---
+    # Additional numeric annotation: min/max density (grid) as a textbox.
+    axs_cmp[1].text(
+        0.02,
+        0.98,
+        "min(rho) = {mn}\nmax(rho) = {mx}".format(
+            mn=f"{float(np.min(rho_grid)):.12g}",
+            mx=f"{float(np.max(rho_grid)):.12g}",
+        ),
+        transform=axs_cmp[1].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    plot_scalar_field(
+        axs_cmp[2],
+        particles.x,
+        particles.y,
+        rho_diff_abs,
+        title="Plot C: |rho_naive − rho_grid|",
+        cbar_label="|Δρ|",
+        cmap="magma",
+        focus_index=focus_index,
+        h=h,
+    )
+
+    axs_cmp[2].text(
+        0.02,
+        0.98,
+        "max(|Δρ|) = {v}\nSame physics, fewer neighbor checks".format(v=f"{rho_diff_abs_max:.6g}"),
+        transform=axs_cmp[2].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+
+    fig_cmp.suptitle("SPH Density Comparison: naive vs grid", fontsize=14, y=0.98)
+    fig_cmp.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
 
     # --- Deutsch ---
     # Anzeigen (kein File-I/O, keine Prints)
