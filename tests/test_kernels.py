@@ -49,7 +49,7 @@ if str(SRC_PATH) not in sys.path:
 import numpy as np
 import pytest
 
-from sph_sim.core.kernels import poly6_kernel
+from sph_sim.core.kernels import poly6_kernel, spiky_kernel_gradient
 
 
 def test_poly6_kernel_raises_for_nonpositive_h() -> None:
@@ -251,4 +251,150 @@ def test_poly6_kernel_array_input_shape() -> None:
     # For r=2.0, the distance is outside the support (2.0 > 1.0) → 0.
     assert W[-1] == 0.0
 
+
+def test_spiky_kernel_gradient_raises_for_nonpositive_h() -> None:
+    """
+    DE:
+    Test F: h Validierung für den Spiky-Gradienten.
+
+    Warum?
+    - h ist eine Länge (Influenzradius / smoothing length).
+    - Bei h <= 0 wäre die Formel unsinnig und würde in der Konstante h^5 Probleme machen.
+
+    EN:
+    Test F: h validation for the spiky gradient.
+
+    Why?
+    - h is a length (influence radius / smoothing length).
+    - For h <= 0 the formula is meaningless and would cause issues in the constant h^5.
+    """
+
+    # --- Deutsch ---
+    # h = 0 → ValueError
+    #
+    # --- English ---
+    # h = 0 → ValueError
+    with pytest.raises(ValueError):
+        spiky_kernel_gradient(dx=1.0, dy=0.0, h=0.0)
+
+    # --- Deutsch ---
+    # h < 0 → ValueError
+    #
+    # --- English ---
+    # h < 0 → ValueError
+    with pytest.raises(ValueError):
+        spiky_kernel_gradient(dx=1.0, dy=0.0, h=-1.0)
+
+
+def test_spiky_kernel_gradient_is_zero_outside_support() -> None:
+    """
+    DE:
+    Test G: außerhalb des Supports (r > h) ist der Gradient (0, 0).
+
+    Warum?
+    - SPH-Kerne haben compact support.
+    - Außerhalb des Radius h soll es keinen Beitrag geben.
+
+    EN:
+    Test G: outside the support (r > h) the gradient is (0, 0).
+
+    Why?
+    - SPH kernels have compact support.
+    - Outside radius h there should be no contribution.
+    """
+
+    h = 1.0
+
+    # --- Deutsch ---
+    # Wir wählen dx so, dass r eindeutig größer als h ist (r = 2.0).
+    #
+    # --- English ---
+    # We choose dx so that r is clearly larger than h (r = 2.0).
+    gx, gy = spiky_kernel_gradient(dx=2.0, dy=0.0, h=h)
+
+    assert gx == 0.0
+    assert gy == 0.0
+
+
+def test_spiky_kernel_gradient_is_zero_at_r_equals_zero() -> None:
+    """
+    DE:
+    Test H: Sonderfall r == 0 → (0, 0).
+
+    Warum?
+    - In der Formel würde /r stehen (Richtung dx/r, dy/r).
+    - Bei r == 0 wäre das Division durch 0.
+    - Außerdem ist die Richtung bei exakt gleicher Position nicht definiert.
+
+    EN:
+    Test H: special case r == 0 → (0, 0).
+
+    Why?
+    - The formula would contain /r (direction dx/r, dy/r).
+    - At r == 0 this would be division by zero.
+    - Also the direction is not defined when the positions are exactly equal.
+    """
+
+    gx, gy = spiky_kernel_gradient(dx=0.0, dy=0.0, h=1.0)
+    assert gx == 0.0
+    assert gy == 0.0
+
+
+def test_spiky_kernel_gradient_direction_dx_positive_dy_zero() -> None:
+    """
+    DE:
+    Test I: Richtungstest (sehr einfach).
+
+    Setup:
+    - dy = 0 → Wir erwarten gy ≈ 0.
+    - dx > 0 und r < h → gx sollte ungleich 0 sein.
+
+    Vorzeichen-Idee:
+    - In unserer Implementierung ist die Konstante C positiv.
+    - Für 0 < r < h gilt (h - r)^2 > 0 und /r > 0.
+    - Also ist factor positiv.
+    - Wenn dx > 0, dann ist gx = factor * dx > 0.
+
+    EN:
+    Test I: direction test (very simple).
+
+    Setup:
+    - dy = 0 → we expect gy ≈ 0.
+    - dx > 0 and r < h → gx should be non-zero.
+
+    Sign idea:
+    - In our implementation the constant C is positive.
+    - For 0 < r < h, (h - r)^2 > 0 and /r > 0.
+    - Therefore factor is positive.
+    - If dx > 0, then gx = factor * dx > 0.
+    """
+
+    h = 1.0
+    dx = 0.2
+    dy = 0.0
+
+    gx, gy = spiky_kernel_gradient(dx=dx, dy=dy, h=h)
+
+    # --- Deutsch ---
+    # gy sollte (numerisch) 0 sein, weil dy = 0 ist.
+    # Wir nutzen eine Toleranz, weil Fließkommazahlen nie perfekt sind.
+    #
+    # --- English ---
+    # gy should be (numerically) 0 because dy = 0.
+    # We use a tolerance because floating-point numbers are never perfect.
+    assert np.isclose(gy, 0.0, atol=1e-15)
+
+    # --- Deutsch ---
+    # gx muss ungleich 0 sein (wir sind innerhalb des Supports und dx != 0).
+    #
+    # --- English ---
+    # gx must be non-zero (we are inside the support and dx != 0).
+    assert gx != 0.0
+
+    # --- Deutsch ---
+    # Vorzeichen: bei dx > 0 erwarten wir gx > 0 (siehe Erklärung oben).
+    #
+    # --- English ---
+    # Sign: for dx > 0 we expect gx > 0 (see explanation above).
+    assert gx > 0.0
 
