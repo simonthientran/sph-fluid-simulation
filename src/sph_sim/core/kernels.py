@@ -257,3 +257,153 @@ def poly6_kernel(r: float | np.ndarray, h: float) -> float | np.ndarray:
     return W
 
 
+def spiky_kernel_gradient(dx: float, dy: float, h: float) -> tuple[float, float]:
+    """
+    DE:
+    Gradient des Spiky-Kernels in 2D (als Vektor) für Druckkräfte in SPH.
+
+    Warum ist das ein Vektor?
+    -------------------------
+    Ein Gradient ist die Ableitung einer Skalarfunktion nach dem Ort.
+    In 2D bedeutet das:
+
+        ∇W = (∂W/∂x, ∂W/∂y)
+
+    Also: zwei Komponenten (x- und y-Richtung).
+
+    Warum brauchen wir den Spiky-Gradienten?
+    ----------------------------------------
+    In vielen SPH-Formulierungen werden **Druckkräfte** mit einem Kernel-Gradienten
+    berechnet. Der Spiky-Kernel (bzw. sein Gradient) ist dafür sehr üblich, weil er
+    sich numerisch gut verhält (starker, “spitzer” Gradient nahe am Partikel).
+
+    Sonderfall r == 0
+    -----------------
+    Wir brauchen die Richtung (dx/r, dy/r). Dafür müssten wir durch r teilen.
+    Wenn r == 0 wäre das eine Division durch 0.
+    Physikalisch ist die Richtung bei r==0 auch “undefiniert” (keine bevorzugte Richtung).
+    Daher geben wir in diesem Fall (0, 0) zurück.
+
+    Support / compact support
+    -------------------------
+    Wie bei vielen SPH-Kernen gilt: für r > h ist der Beitrag 0.
+    Deshalb geben wir außerhalb des Radius h ebenfalls (0, 0) zurück.
+
+    Verwendete Form (typisch, 2D)
+    -----------------------------
+    - Konstante:
+
+        C = -30 / (pi * h^5)
+
+      (negativ, weil der Kernel mit r abnimmt und der Gradient nach “außen” zeigt)
+
+    - Betrag proportional zu (h - r)^2
+    - Richtung = (dx/r, dy/r)
+
+    Implementiert als:
+
+        factor = C * (h - r)^2 / r
+        gx = factor * dx
+        gy = factor * dy
+
+    EN:
+    Gradient of the Spiky kernel in 2D (as a vector) for pressure forces in SPH.
+
+    Why is this a vector?
+    ---------------------
+    A gradient is the derivative of a scalar function with respect to position.
+    In 2D this means:
+
+        ∇W = (∂W/∂x, ∂W/∂y)
+
+    So: two components (x and y direction).
+
+    Why do we need the Spiky gradient?
+    ----------------------------------
+    In many SPH formulations, **pressure forces** are computed using a kernel gradient.
+    The Spiky kernel (or rather its gradient) is commonly used because it behaves well
+    numerically (a strong, “spiky” gradient close to the particle).
+
+    Special case r == 0
+    -------------------
+    We need the direction (dx/r, dy/r), which requires division by r.
+    If r == 0, this would be a division by zero.
+    Physically, the direction at r==0 is also “undefined” (no preferred direction).
+    Therefore we return (0, 0) in this case.
+
+    Support / compact support
+    -------------------------
+    As with many SPH kernels: for r > h the contribution is 0.
+    Therefore outside the radius h we also return (0, 0).
+
+    Used form (typical, 2D)
+    -----------------------
+    - Constant:
+
+        C = -30 / (pi * h^5)
+
+      (negative because the kernel decreases with r and the gradient points “outwards”)
+
+    - Magnitude proportional to (h - r)^2
+    - Direction = (dx/r, dy/r)
+
+    Implemented as:
+
+        factor = C * (h - r)^2 / r
+        gx = factor * dx
+        gy = factor * dy
+    """
+
+    # --- Deutsch ---
+    # Validierung: h muss > 0 sein.
+    #
+    # --- English ---
+    # Validation: h must be > 0.
+    if h <= 0.0:
+        raise ValueError("h muss > 0 sein.")
+
+    # --- Deutsch ---
+    # Distanz r aus dem Differenzvektor (dx, dy).
+    #
+    # --- English ---
+    # Distance r from the difference vector (dx, dy).
+    r = float(np.sqrt(float(dx) * float(dx) + float(dy) * float(dy)))
+
+    # --- Deutsch ---
+    # Sonderfälle:
+    # - r == 0: Richtung ist nicht definiert (Division durch 0 vermeiden).
+    # - r > h: außerhalb des Supports → Gradient ist 0.
+    #
+    # --- English ---
+    # Special cases:
+    # - r == 0: direction is undefined (avoid division by 0).
+    # - r > h: outside support → gradient is 0.
+    if r == 0.0 or r > float(h):
+        return (0.0, 0.0)
+
+    # --- Deutsch ---
+    # 2D-Konstante für den Spiky-Gradienten:
+    # Negativ, weil der Kernel mit r abnimmt.
+    #
+    # --- English ---
+    # 2D constant for the spiky gradient:
+    # Negative because the kernel decreases with r.
+    C = 30.0 / (np.pi * (float(h) ** 5))
+
+    # --- Deutsch ---
+    # Faktor:
+    # - (h - r)^2 liefert die typische “spiky” Form.
+    # - / r sorgt für die Richtungskomponenten (dx/r, dy/r) in einem Schritt.
+    #
+    # --- English ---
+    # Factor:
+    # - (h - r)^2 gives the typical “spiky” shape.
+    # - / r applies the direction components (dx/r, dy/r) in one step.
+    factor = float(C) * (float(h) - r) ** 2 / r
+
+    gx = factor * float(dx)
+    gy = factor * float(dy)
+
+    return (float(gx), float(gy))
+
+
