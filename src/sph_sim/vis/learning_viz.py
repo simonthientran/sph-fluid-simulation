@@ -109,15 +109,18 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.animation import FuncAnimation
 
 import json
 import time
 
-from sph_sim.core.particles import initialize_particles_cube
+from sph_sim.core.particles import ParticleSet2D, initialize_particles_cube
 from sph_sim.core.kernels import poly6_kernel
 from sph_sim.core.density import compute_density_naive
 from sph_sim.core.pressure import compute_pressure_eos
 from sph_sim.core.neighbor_search import build_uniform_grid, query_neighbor_candidates
+from sph_sim.core.forces import compute_pressure_acceleration
+from sph_sim.core.integration import step_semi_implicit_euler
 
 try:
     from sph_sim.core.density_grid import compute_density_grid
@@ -217,6 +220,140 @@ def _distances_to_focus(x: np.ndarray, y: np.ndarray, focus_index: int) -> np.nd
     # --- English ---
     # Euclidean distance r = sqrt(dx^2 + dy^2) for all particles at once
     return np.sqrt(dx * dx + dy * dy)
+
+
+def _compute_shared_xy_limits(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    focus_index: int,
+    h: float,
+    dx: float,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """
+    DE:
+    Berechne gemeinsame Achsen-Limits (xlim/ylim) für ALLE Partikel-Plots.
+
+    Ziel:
+    - Alle Diagramme, die Partikel in x/y zeigen, sollen denselben sichtbaren Bereich haben.
+    - Dann sind die Plots direkt vergleichbar ("gleiche Werte / gleiche Skala").
+
+    Heuristik:
+    - Wir nehmen den gesamten Partikelbereich (min/max von x und y).
+    - Wir geben einen kleinen Rand (dx/2), damit die Punkte nicht "am Rand kleben".
+    - Wir stellen sicher, dass der Radius h um den Fokus komplett sichtbar ist.
+    - Wir "snappen" die Grenzen auf ein dx-Raster (ruhiger, gleichmäßiger Look).
+
+    EN:
+    Compute shared axis limits (xlim/ylim) for ALL particle plots.
+
+    Goal:
+    - All diagrams that show particles in x/y should use the same visible area.
+    - Then plots are directly comparable ("same values / same scale").
+
+    Heuristic:
+    - Use the full particle domain (min/max of x and y).
+    - Add a small margin (dx/2) so points do not stick to the border.
+    - Ensure the radius h around the focus is fully visible.
+    - Snap bounds to a dx grid (calmer, more uniform look).
+    """
+
+    dx_f = float(dx)
+    h_f = float(h)
+    if dx_f <= 0.0:
+        raise ValueError("dx muss > 0 sein.")
+    if h_f <= 0.0:
+        raise ValueError("h muss > 0 sein.")
+
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64)
+
+    x_min = float(np.min(x_arr))
+    x_max = float(np.max(x_arr))
+    y_min = float(np.min(y_arr))
+    y_max = float(np.max(y_arr))
+
+    x_focus = float(x_arr[int(focus_index)])
+    y_focus = float(y_arr[int(focus_index)])
+
+    pad = 0.5 * dx_f
+
+    x_needed_min = min(x_min - pad, x_focus - h_f)
+    x_needed_max = max(x_max + pad, x_focus + h_f)
+    y_needed_min = min(y_min - pad, y_focus - h_f)
+    y_needed_max = max(y_max + pad, y_focus + h_f)
+
+    # --- Deutsch ---
+    # Auf dx-Raster "snappen" für ruhige, gleichmäßige Achsen.
+    #
+    # --- English ---
+    # Snap to dx grid for calm, uniform axes.
+    x0 = float(np.floor(x_needed_min / dx_f) * dx_f)
+    x1 = float(np.ceil(x_needed_max / dx_f) * dx_f)
+    y0 = float(np.floor(y_needed_min / dx_f) * dx_f)
+    y1 = float(np.ceil(y_needed_max / dx_f) * dx_f)
+
+    return (x0, x1), (y0, y1)
+
+
+def _apply_shared_xy_limits(ax, xlim: tuple[float, float], ylim: tuple[float, float]) -> None:
+    """
+    DE:
+    Wende gemeinsame Achsen-Limits auf eine Achse an.
+
+    EN:
+    Apply shared axis limits to an axis.
+    """
+
+    ax.set_xlim(float(xlim[0]), float(xlim[1]))
+    ax.set_ylim(float(ylim[0]), float(ylim[1]))
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _link_xy_axes(axes: list) -> None:
+    """
+    DE:
+    "Verknüpfe" mehrere Matplotlib-Achsen:
+    - Wenn du in EINEM Plot zoomst/pannst, übernehmen die anderen denselben x/y Ausschnitt.
+
+    Hinweis:
+    - Matplotlib unterstützt `sharex/sharey` nur sauber innerhalb einer Figure.
+    - Für mehrere Figures nutzen wir Callbacks.
+
+    EN:
+    "Link" multiple Matplotlib axes:
+    - If you zoom/pan in ONE plot, the others adopt the same x/y view.
+
+    Note:
+    - Matplotlib supports `sharex/sharey` cleanly only within one figure.
+    - Across multiple figures we use callbacks.
+    """
+
+    axes_clean = [ax for ax in axes if ax is not None]
+    if len(axes_clean) <= 1:
+        return
+
+    guard = {"busy": False}
+
+    def _sync_from(source_ax) -> None:
+        if guard["busy"]:
+            return
+        guard["busy"] = True
+        try:
+            xlim = source_ax.get_xlim()
+            ylim = source_ax.get_ylim()
+            for ax in axes_clean:
+                if ax is source_ax:
+                    continue
+                ax.set_xlim(xlim)
+                ax.set_ylim(ylim)
+                ax.figure.canvas.draw_idle()
+        finally:
+            guard["busy"] = False
+
+    for ax in axes_clean:
+        ax.callbacks.connect("xlim_changed", _sync_from)
+        ax.callbacks.connect("ylim_changed", _sync_from)
 
 
 def draw_uniform_grid(
@@ -1046,7 +1183,17 @@ def plot_poly6_kernel_curve(ax, h: float, num_samples: int = 200) -> None:
     ax.legend(loc="best")
 
 
-def plot_density(ax, x, y, rho, focus_index: int, h: float) -> None:
+def plot_density(
+    ax,
+    x,
+    y,
+    rho,
+    focus_index: int,
+    h: float,
+    *,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
     """
     DE:
     Plot: Dichte pro Partikel als Farbe + Fokus-Partikel + Kreis mit Radius h.
@@ -1080,9 +1227,17 @@ def plot_density(ax, x, y, rho, focus_index: int, h: float) -> None:
     # --- Deutsch ---
     # Scatter mit Farbskala (c=rho)
     #
+    # Zusatz (für konsistente Plots):
+    # - Optional können wir vmin/vmax setzen, damit mehrere Dichte-Plots
+    #   exakt dieselbe Farbskala verwenden (direkt vergleichbar).
+    #
     # --- English ---
     # Scatter with a color scale (c=rho)
-    sc = ax.scatter(x, y, c=rho, s=45, cmap="viridis")
+    #
+    # Extra (for consistent plots):
+    # - Optionally we can set vmin/vmax so multiple density plots use
+    #   exactly the same color scale (directly comparable).
+    sc = ax.scatter(x, y, c=rho, s=45, cmap="viridis", vmin=vmin, vmax=vmax)
 
     # --- Deutsch ---
     # Colorbar gehört zur ganzen Figure, aber wir hängen sie an diese Achse.
@@ -1160,6 +1315,9 @@ def plot_scalar_field(
     title: str,
     cbar_label: str,
     cmap: str = "viridis",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    norm=None,
     focus_index: int | None = None,
     h: float | None = None,
 ) -> None:
@@ -1190,9 +1348,20 @@ def plot_scalar_field(
     # --- Deutsch ---
     # Scatter: jeder Partikel bekommt eine Farbe entsprechend `values[i]`.
     #
+    # Zusatz (für konsistente Plots):
+    # - Optional können wir vmin/vmax oder eine Normierung (`norm`) setzen,
+    #   damit mehrere Plots exakt dieselbe Farbskala verwenden.
+    #
     # --- English ---
     # Scatter: each particle gets a color according to `values[i]`.
-    sc = ax.scatter(x, y, c=values, s=45, cmap=cmap)
+    #
+    # Extra (for consistent plots):
+    # - Optionally we can set vmin/vmax or a normalization (`norm`)
+    #   so multiple plots use exactly the same color scale.
+    if norm is None:
+        sc = ax.scatter(x, y, c=values, s=45, cmap=cmap, vmin=vmin, vmax=vmax)
+    else:
+        sc = ax.scatter(x, y, c=values, s=45, cmap=cmap, norm=norm)
 
     # --- Deutsch ---
     # Colorbar: erklärt die Farbskala.
@@ -1241,6 +1410,11 @@ def run_learning_viz(
     mass_per_particle: float = 0.01,
     h: float = 0.15,
     focus_index: int = 0,
+    use_synthetic_pressure: bool = False,
+    n_steps: int = 500,
+    dt: float = 0.001,
+    damping: float = 0.02,
+    show_focus_trajectory: bool = True,
 ) -> None:
     """
     DE:
@@ -1274,6 +1448,16 @@ def run_learning_viz(
     Note for beginners:
     - If you make dx very small, you create many particles.
     - The naive density computation is O(N^2) and becomes slow.
+
+    Zusatz (Mini-Simulation, nur Demo):
+    - Optional läuft am Ende ein kleiner Simulationsloop (keine Animation), der pro Schritt
+      `rho → p → a → Integration` ausführt und dann Start/Ende gegenüberstellt.
+    - Das ist nur eine Demonstration, kein “voller SPH-Solver”.
+
+    Additional (mini simulation, demo only):
+    - Optionally, a small simulation loop runs at the end (no animation) that performs
+      `rho → p → a → integration` per step and then compares start vs end.
+    - This is only a demonstration, not a “full SPH solver”.
     """
 
     # --- Deutsch ---
@@ -1286,6 +1470,11 @@ def run_learning_viz(
     _validate_positive("rho0", rho0)
     _validate_positive("mass_per_particle", mass_per_particle)
     _validate_positive("h", h)
+    if int(n_steps) <= 0:
+        raise ValueError("n_steps muss > 0 sein.")
+    _validate_positive("dt", dt)
+    if float(damping) < 0.0 or float(damping) >= 1.0:
+        raise ValueError("damping muss in [0, 1) liegen.")
 
     # --- Deutsch ---
     # Demo-Defaults (warum gerade dx=0.1 und h=1.5*dx?):
@@ -1511,126 +1700,318 @@ def run_learning_viz(
 
     # --- Deutsch ---
     # -------------------------------------------------------------------------
-    # Demo-Referenzdichte (nur Visualisierung)
+    # Gemeinsame Farbskala für Dichte-Plots (rho)
     # -------------------------------------------------------------------------
-    # Problem im Lern-Demo:
-    # - Unsere "berechnete" SPH-Dichte rho (Kernel-Summe) ist in diesem Projekt nicht automatisch
-    #   so skaliert, dass sie exakt um rho0=1000.0 liegt.
-    # - Wenn wir trotzdem rho0=1000.0 direkt in eine EOS stecken, ergibt sich oft:
-    #     rho - rho0 < 0  → Druck wäre überwiegend negativ.
+    # Ziel:
+    # - Wenn wir mehrere Dichtebilder vergleichen (naiv vs grid vs andere Plots),
+    #   sollen gleiche Farben auch wirklich gleiche Werte bedeuten.
     #
-    # Lösung für anschauliche Visualisierung:
-    # - Wir definieren einen Demo-Referenzwert rho0_demo als Mittelwert der berechneten Dichte.
-    # - Dieser Wert ist NUR für Visualisierung/Debugging gedacht, damit wir relative Unterschiede sehen.
-    # - Eine "echte" Simulation nutzt später rho0 aus Configs/Units und kalibriert Massen/Kernel entsprechend.
+    # Umsetzung:
+    # - Wir definieren vmin/vmax einmal global aus allen relevanten rho-Arrays.
     #
     # --- English ---
     # -------------------------------------------------------------------------
-    # Demo reference density (visualization only)
+    # Shared color scale for density plots (rho)
     # -------------------------------------------------------------------------
-    # Problem in this learning demo:
-    # - Our "computed" SPH density rho (kernel sum) is not automatically scaled in this project
-    #   to lie around rho0=1000.0.
-    # - If we still plug rho0=1000.0 directly into an EOS, we often get:
-    #     rho - rho0 < 0  → pressure is mostly negative.
+    # Goal:
+    # - When comparing multiple density images (naive vs grid vs other plots),
+    #   the same colors should truly mean the same values.
     #
-    # Solution for an intuitive visualization:
-    # - We define a demo reference value rho0_demo as the mean of the computed density.
-    # - This value is ONLY for visualization/debugging so we can see relative differences.
-    # - A "real" simulation later uses rho0 from configs/units and calibrates masses/kernel accordingly.
-    rho0_demo = float(np.mean(rho))
+    # Implementation:
+    # - We define vmin/vmax once globally from all relevant rho arrays.
+    if rho_grid is not None:
+        rho_vmin = float(min(float(np.min(rho_naive)), float(np.min(rho_grid))))
+        rho_vmax = float(max(float(np.max(rho_naive)), float(np.max(rho_grid))))
+    else:
+        rho_vmin = float(np.min(rho_naive))
+        rho_vmax = float(np.max(rho_naive))
 
     # --- Deutsch ---
     # -------------------------------------------------------------------------
-    # Druck über EOS (Equation of State) berechnen
+    # Einheitliche Referenzdichte für ALLE Diagramme (Demo/Visualisierung)
     # -------------------------------------------------------------------------
-    # Wir berechnen Druck aus Dichte über eine einfache EOS (p = k*(rho - rho0)).
+    # Ziel:
+    # - Alle Plots sollen auf denselben Daten basieren und logisch zusammenhängen.
+    #
+    # Wir wählen deshalb:
+    #   rho0_ref = mean(rho)
+    #
+    # Warum ist das didaktisch gut?
+    # - Dann ist drho = rho - rho0_ref automatisch um 0 zentriert:
+    #   einige Partikel haben drho < 0 (unter dem Mittel), andere drho > 0 (über dem Mittel).
+    # - Dadurch sehen wir im Demo klar BOTH:
+    #   - negative Abweichung → negativer Druck
+    #   - positive Abweichung → positiver Druck
+    #
+    # WICHTIG:
+    # - Das ist nur für Demo/Visualisierung.
+    # - Eine echte Simulation nutzt später ein festes rho0 (z.B. Wasser: 1000 kg/m^3)
+    #   und kalibriert Massen/Kernel/Units entsprechend.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # One shared reference density for ALL diagrams (demo/visualization)
+    # -------------------------------------------------------------------------
+    # Goal:
+    # - All plots should be based on the same data and be logically connected.
+    #
+    # Therefore we choose:
+    #   rho0_ref = mean(rho)
+    #
+    # Why is this didactically useful?
+    # - Then drho = rho - rho0_ref is automatically centered around 0:
+    #   some particles have drho < 0 (below the mean), others drho > 0 (above the mean).
+    # - This makes it easy to clearly show BOTH in the demo:
+    #   - negative deviation → negative pressure
+    #   - positive deviation → positive pressure
+    #
+    # IMPORTANT:
+    # - This is demo/visualization only.
+    # - A real simulation later uses a fixed rho0 (e.g., water: 1000 kg/m^3)
+    #   and calibrates masses/kernel/units accordingly.
+    rho0_ref = float(np.mean(rho))
+
+    # --- Deutsch ---
+    # Dichteabweichung:
+    # drho = rho - rho0_ref
+    #
+    # --- English ---
+    # Density deviation:
+    # drho = rho - rho0_ref
+    drho = rho - float(rho0_ref)
+
+    # --- Deutsch ---
+    # EOS-Parameter k (Demo-Default):
+    # - Relativ klein, damit die Bewegung bei vielen Steps ruhiger bleibt.
+    # - Das ist nur eine Skalierung im Demo (keine Änderung an der Kernphysik).
+    #
+    # --- English ---
+    # EOS parameter k (demo default):
+    # - Relatively small so motion stays calmer over many steps.
+    # - This is only a demo scaling choice (no change to core physics).
+    k = 25.0
+
+    # --- Deutsch ---
+    # Druck aus der EOS, ohne Clamping:
+    #
+    # p = k * (rho - rho0_ref) = k * drho
+    #
+    # Wichtig (Didaktik):
+    # - p ist DIREKT proportional zu drho.
+    # - Deshalb müssen drho und p die gleiche "Struktur" zeigen (nur skaliert).
+    #
+    # --- English ---
+    # Pressure from EOS, without clamping:
+    #
+    # p = k * (rho - rho0_ref) = k * drho
+    #
+    # Important (teaching):
+    # - p is DIRECTLY proportional to drho.
+    # - Therefore drho and p must show the same "structure" (just scaled).
+    p = compute_pressure_eos(rho=rho, rho0=float(rho0_ref), k=float(k), clamp_negative=False)
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Debug-Option: synthetischer Druck für "garantiert sichtbare" Druckkräfte
+    # -------------------------------------------------------------------------
+    # Motivation:
+    # - Manchmal ist die echte EOS-Druckverteilung (aus rho) für ein perfektes Gitter
+    #   sehr "ruhig" oder symmetrisch, sodass die Kräfte im Plot klein wirken.
+    #
+    # Debug-Idee:
+    # - Wir definieren künstlich einen Druck, der radial nach außen abnimmt:
+    #
+    #     p_synth = -r
+    #
+    #   wobei r der Abstand zum Zentrum (L/2, L/2) ist.
+    #
+    # Warum ist der Druck in der Mitte "am höchsten"?
+    # - Bei r = 0 (Zentrum) ist p = 0.
+    # - Für r > 0 ist p negativ.
+    # - Also ist p im Zentrum maximal (am wenigsten negativ).
+    #
+    # Erwartung (Didaktik):
+    # - Druck ist in der Mitte höher als außen.
+    # - Druckkräfte treiben (tendenziell) von hohem Druck zu niedrigem Druck.
+    # - Daher sollten die Beschleunigungs-Pfeile im Plot nach außen zeigen.
+    #
+    # WICHTIG:
+    # - Das ist NUR Debug/Visualisierung.
+    # - Das überschreibt die EOS-Pipeline (rho → drho → p) bewusst.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Debug option: synthetic pressure for "guaranteed visible" pressure forces
+    # -------------------------------------------------------------------------
+    # Motivation:
+    # - Sometimes the real EOS pressure field (from rho) for a perfect grid
+    #   is very "calm" or symmetric, so forces look small in the plot.
+    #
+    # Debug idea:
+    # - We define an artificial pressure that decreases radially outward:
+    #
+    #     p_synth = -r
+    #
+    #   where r is the distance to the domain center (L/2, L/2).
+    #
+    # Why is pressure "highest" in the center?
+    # - At r = 0 (center), p = 0.
+    # - For r > 0, p is negative.
+    # - Therefore the center has the maximum p (least negative).
+    #
+    # Expectation (teaching):
+    # - Pressure is higher in the center than outside.
+    # - Pressure forces (tend to) push from high pressure to low pressure.
+    # - Therefore the acceleration arrows in the plot should point outward.
+    #
+    # IMPORTANT:
+    # - This is debug/visualization only.
+    # - It intentionally overrides the EOS pipeline (rho → drho → p).
+    p_for_force = p
+    if bool(use_synthetic_pressure):
+        x_center = 0.5 * float(L)
+        y_center = 0.5 * float(L)
+        r_center = np.sqrt((particles.x - x_center) ** 2 + (particles.y - y_center) ** 2)
+        p_for_force = -np.asarray(r_center, dtype=np.float64)
+
+    # --- Deutsch ---
+    # Für Diagnose/Plot: min/max von rho, drho, p als Zahlen.
+    #
+    # --- English ---
+    # For diagnostics/plots: numeric min/max of rho, drho, p.
+    rho_min = float(np.min(rho)) if rho.size > 0 else 0.0
+    rho_max = float(np.max(rho)) if rho.size > 0 else 0.0
+    drho_min = float(np.min(drho)) if drho.size > 0 else 0.0
+    drho_max = float(np.max(drho)) if drho.size > 0 else 0.0
+    p_min = float(np.min(p)) if p.size > 0 else 0.0
+    p_max = float(np.max(p)) if p.size > 0 else 0.0
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Druckbeschleunigung (Kräfte) berechnen und später als Pfeile visualisieren
+    # -------------------------------------------------------------------------
+    # Jetzt kommt der nächste Schritt: aus dem Druck p werden Kräfte/Accelerations.
+    #
+    # WICHTIG (Didaktik):
+    # - Wir nutzen hier explizit:
+    #   - rho = unsere (grid-basierte) SPH-Dichte
+    #   - p = Druck aus der EOS (ungeclamped, kann negativ sein)
+    # - Das ist didaktisch wichtig, weil so negative/positive Druckwerte sichtbar bleiben.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Compute pressure acceleration (forces) and later visualize as arrows
+    # -------------------------------------------------------------------------
+    # Now we take the next step: from pressure p we compute forces/accelerations.
+    #
+    # IMPORTANT (teaching):
+    # - We explicitly use:
+    #   - rho = our (grid-based) SPH density
+    #   - p = pressure from EOS (unclamped, can be negative)
+    # - This is didactically important because negative/positive pressures stay visible.
+    ax_pressure, ay_pressure = compute_pressure_acceleration(
+        particles=particles,
+        rho=rho,
+        p=p_for_force,
+        h=float(h),
+        cell_size=float(cell_size),
+    )
+
+    # --- Deutsch ---
+    # Pfeil-Skalierung (arrow_scale):
+    #
+    # Problem:
+    # - (ax, ay) haben physikalische Einheiten (Beschleunigung).
+    # - Unsere Plot-Achsen sind Positions-Einheiten (x/y im Quadrat [0, L)).
+    # - Wenn wir Beschleunigungen "1:1" als Pfeile zeichnen, sind sie meistens
+    #   viel zu klein oder viel zu groß, je nach Parametern.
+    #
+    # Lösung:
+    # - Wir skalieren die Pfeillängen mit einem Faktor arrow_scale, rein für Lesbarkeit.
+    # - Das ändert keine Physik – es ist nur eine Visualisierungs-Hilfe.
+    #
+    # --- English ---
+    # Arrow scaling (arrow_scale):
+    #
+    # Problem:
+    # - (ax, ay) have physical units (acceleration).
+    # - Our plot axes are position units (x/y in the square [0, L)).
+    # - If we draw acceleration vectors "1:1", arrows are usually
+    #   far too small or far too large depending on parameters.
+    #
+    # Solution:
+    # - We scale arrow lengths with a factor arrow_scale purely for readability.
+    # - This changes no physics – it is only a visualization aid.
+    # --- Deutsch ---
+    # Auto-Skalierung (praktischer als ein fixer Wert):
+    # - Wir wählen eine Ziel-Pfeillänge in "Plot-Einheiten" (also ungefähr in x/y-Einheiten).
+    # - Dann skalieren wir so, dass der größte (gezeichnete) Beschleunigungsvektor ungefähr
+    #   diese Ziel-Länge bekommt.
+    #
+    # Vorteil:
+    # - Egal ob deine Parameter "kleine" oder "große" Beschleunigungen erzeugen:
+    #   du siehst im Plot immer etwas.
+    #
+    # --- English ---
+    # Auto scaling (more practical than a fixed value):
+    # - We choose a target arrow length in "plot units" (roughly x/y units).
+    # - Then we scale so that the largest (drawn) acceleration vector gets roughly
+    #   that target length.
+    #
+    # Advantage:
+    # - No matter whether your parameters produce "small" or "large" accelerations:
+    #   you will always see something in the plot.
+    a_mag = np.sqrt(ax_pressure * ax_pressure + ay_pressure * ay_pressure)
+
+    # --- Deutsch ---
+    # Pfeil-Skalierung, die garantiert "sichtbar" ist:
+    #
+    # Idee:
+    # - Wir möchten, dass der größte Pfeil ungefähr eine feste Länge im Plot hat (z.B. 0.15).
+    # - Dafür skalieren wir alle Pfeile mit:
+    #
+    #     arrow_mult = 0.15 / max(|a|)
     #
     # Wichtig:
-    # - Das ist weiterhin nur "Zustand": p wird aus rho berechnet.
-    # - Die Physik-Kräfte (Druckkräfte) kommen erst in einem späteren Modul.
-    #
-    # Didaktik:
-    # - p hängt DIREKT von (rho - rho0) ab.
-    # - Darum ist drho = (rho - rho0) eine sehr direkte Visualisierung für "warum" Druck entsteht.
+    # - Das ist nur Visualisierung (Einheiten/Lesbarkeit), KEINE Physikänderung.
     #
     # --- English ---
-    # -------------------------------------------------------------------------
-    # Compute pressure via EOS (equation of state)
-    # -------------------------------------------------------------------------
-    # We compute pressure from density via a simple EOS (p = k*(rho - rho0)).
+    # Arrow scaling that makes arrows reliably "visible":
+    #
+    # Idea:
+    # - We want the largest arrow to have roughly a fixed length in plot units (e.g. 0.15).
+    # - Therefore we scale all arrows with:
+    #
+    #     arrow_mult = 0.15 / max(|a|)
     #
     # Important:
-    # - This is still only "state": p is computed from rho.
-    # - Pressure forces come later in a separate module.
-    #
-    # Teaching:
-    # - p depends DIRECTLY on (rho - rho0).
-    # - Therefore drho = (rho - rho0) is a very direct visualization of "why" pressure appears.
-    rho_for_pressure = rho
+    # - This is visualization only (units/readability), NOT a physics change.
+    a_mag_max = float(np.max(a_mag)) if a_mag.size > 0 else 0.0
+    arrow_mult = 1.0
+    if a_mag_max > 0.0:
+        arrow_mult = 0.15 / a_mag_max
+    else:
+        arrow_mult = 0.0
 
     # --- Deutsch ---
-    # EOS-Parameter k:
-    # - Wir halten k als Demo-Parameter bewusst einfach.
-    # - Es ist KEINE neue Physik, nur eine Skalierung der Druckwerte für die Visualisierung.
+    # Wir verwenden die Variable arrow_scale später beim Quiver-Plot.
+    # (Kompatibel mit dem bestehenden Code – wir setzen sie auf unseren arrow_mult.)
     #
     # --- English ---
-    # EOS parameter k:
-    # - We keep k as a simple demo parameter.
-    # - This is NOT new physics, only a scaling of pressure values for visualization.
-    k = 2.0
+    # We use the variable arrow_scale later in the quiver plot.
+    # (Compatible with the existing code – we set it to our arrow_mult.)
+    arrow_scale = float(arrow_mult)
 
     # --- Deutsch ---
-    # Physikalischer Druck (lesbar gemacht durch Clamping):
-    # - Gleiche EOS wie in der Simulation, aber negative Werte werden auf 0 gesetzt,
-    #   damit Anfänger im Farbbild "wo ist Druck?" leichter erkennen.
-    #
-    # --- English ---
-    # Physical pressure (made readable via clamping):
-    # - Same EOS as in the simulation, but negative values are clamped to 0
-    #   so beginners can more easily see "where is pressure?" in the color plot.
-    p_phys = compute_pressure_eos(rho=rho_for_pressure, rho0=float(rho0), k=float(k), clamp_negative=True)
-
     # --- Deutsch ---
-    # Demo-Druck (anschaulich):
-    # - Wir nutzen rho0_demo als Referenz, damit Druckunterschiede um den Mittelwert sichtbar werden.
-    # - Auch hier clampen wir, damit die Darstellung für Anfänger intuitiv bleibt.
+    # Hinweis:
+    # - Wir haben p bereits als ungeclamp-ten Druck berechnet.
+    # - Dieser Druck enthält negative und positive Werte und ist die Grundlage für die Kraft-Demo.
     #
     # --- English ---
-    # Demo pressure (intuitive):
-    # - We use rho0_demo as reference so pressure differences around the mean become visible.
-    # - We clamp here as well so the visualization remains intuitive for beginners.
-    p_demo = compute_pressure_eos(rho=rho_for_pressure, rho0=float(rho0_demo), k=float(k), clamp_negative=True)
-
-    # --- Deutsch ---
-    # Zusätzlich: Demo-Druck OHNE Clamping (nur Darstellung).
-    #
-    # Warum?
-    # - Wir wollen explizit zeigen: niedrige Dichte (rho < rho0_demo) → negativer Druck.
-    # - Für Anfänger ist das als "Kontrast" sehr lehrreich (Rand/Ecken vs. Innen).
-    #
-    # Wichtig:
-    # - Das ändert keine Core-Physik, weil es nur die Visualisierung betrifft.
-    #
-    # --- English ---
-    # Additionally: demo pressure WITHOUT clamping (visualization only).
-    #
-    # Why?
-    # - We explicitly want to show: low density (rho < rho0_demo) → negative pressure.
-    # - For beginners this contrast is very instructive (boundary/corners vs interior).
-    #
-    # Important:
-    # - This does not change core physics because it is visualization-only.
-    p_demo_raw = compute_pressure_eos(rho=rho_for_pressure, rho0=float(rho0_demo), k=float(k), clamp_negative=False)
-
-    # --- Deutsch ---
-    # Dichteabweichung (kann positiv/negativ sein):
-    # - drho ist direkt der "Input" der EOS (bis auf den Faktor k).
-    #
-    # --- English ---
-    # Density deviation (can be positive/negative):
-    # - drho is directly the "input" to the EOS (up to the factor k).
-    drho = rho_for_pressure - float(rho0_demo)
+    # Note:
+    # - We already computed p as an unclamped pressure.
+    # - This pressure contains negative and positive values and is the basis for the force demo.
 
     # --- Deutsch ---
     # --- Figure mit 3 Subplots ------------------------------------------------
@@ -1709,7 +2090,16 @@ def run_learning_viz(
     #
     # --- English ---
     # Right: density as color
-    plot_density(axs[2], particles.x, particles.y, rho, focus_index=focus_index, h=h)
+    plot_density(
+        axs[2],
+        particles.x,
+        particles.y,
+        rho,
+        focus_index=focus_index,
+        h=h,
+        vmin=rho_vmin,
+        vmax=rho_vmax,
+    )
 
     # --- Deutsch ---
     # Großer Titel über der gesamten Figure
@@ -1817,6 +2207,8 @@ def run_learning_viz(
         title="Plot A: naive rho",
         cbar_label="rho",
         cmap="viridis",
+        vmin=rho_vmin,
+        vmax=rho_vmax,
         focus_index=focus_index,
         h=h,
     )
@@ -1847,6 +2239,8 @@ def run_learning_viz(
         title="Plot B: grid rho",
         cbar_label="rho",
         cmap="viridis",
+        vmin=rho_vmin,
+        vmax=rho_vmax,
         focus_index=focus_index,
         h=h,
     )
@@ -1877,6 +2271,8 @@ def run_learning_viz(
         title="Plot C: |rho_naive − rho_grid|",
         cbar_label="|Δρ|",
         cmap="magma",
+        vmin=0.0,
+        vmax=float(rho_diff_abs_max),
         focus_index=focus_index,
         h=h,
     )
@@ -1897,11 +2293,11 @@ def run_learning_viz(
 
     # --- Deutsch ---
     # -------------------------------------------------------------------------
-    # Zusätzliche Demo-Figure: rho, p_demo und drho als Farben (anschaulich)
+    # Zusätzliche Demo-Figure: rho, p und drho als Farben (anschaulich)
     # -------------------------------------------------------------------------
     # Ziel:
     # - Ein Plot zeigt Dichte rho als Farbe.
-    # - Ein Plot zeigt Demo-Druck p_demo als Farbe (clamped, nur positive Werte).
+    # - Ein Plot zeigt Druck p als Farbe (kann negativ/positiv sein).
     # - Ein Plot zeigt drho = rho - mean(rho) als Farbe (positiv/negativ).
     #
     # Wichtig:
@@ -1909,11 +2305,11 @@ def run_learning_viz(
     #
     # --- English ---
     # -------------------------------------------------------------------------
-    # Additional demo figure: rho, p_demo and drho as colors (intuitive)
+    # Additional demo figure: rho, p and drho as colors (intuitive)
     # -------------------------------------------------------------------------
     # Goal:
     # - One plot shows density rho as color.
-    # - One plot shows demo pressure p_demo as color (clamped, positive values only).
+    # - One plot shows pressure p as color (can be negative/positive).
     # - One plot shows drho = rho - mean(rho) as color (positive/negative).
     #
     # Important:
@@ -1928,16 +2324,18 @@ def run_learning_viz(
         title="Density rho (color)",
         cbar_label="density rho",
         cmap="viridis",
+        vmin=rho_vmin,
+        vmax=rho_vmax,
         focus_index=focus_index,
         h=h,
     )
     axs_demo[0].text(
         0.02,
         0.98,
-        "min(rho) = {mn}\nmax(rho) = {mx}\n\nDensity is computed from neighboring particles via the kernel\n\nrho0_demo = {r0}\nk = {k}".format(
+        "min(rho) = {mn}\nmax(rho) = {mx}\n\nDensity is computed from neighboring particles via the kernel\n\nrho0_ref = {r0}\nk = {k}".format(
             mn=f"{float(np.min(rho)):.12g}",
             mx=f"{float(np.max(rho)):.12g}",
-            r0=f"{float(rho0_demo):.12g}",
+            r0=f"{float(rho0_ref):.12g}",
             k=f"{float(k):.12g}",
         ),
         transform=axs_demo[0].transAxes,
@@ -1948,17 +2346,29 @@ def run_learning_viz(
     )
 
     # --- Deutsch ---
-    # p_demo_raw kann positiv/negativ sein → divergierende Farbskala, zentriert bei 0.
+    # p kann positiv/negativ sein → divergierende Farbskala, zentriert bei 0.
     #
     # --- English ---
-    # p_demo_raw can be positive/negative → diverging colormap centered at 0.
-    p_abs_max = float(np.max(np.abs(p_demo_raw))) if p_demo_raw.size > 0 else 0.0
-    norm_p = TwoSlopeNorm(vcenter=0.0, vmin=-p_abs_max, vmax=p_abs_max)
-    sc_p = axs_demo[1].scatter(particles.x, particles.y, c=p_demo_raw, s=45, cmap="coolwarm", norm=norm_p)
+    # p can be positive/negative → diverging colormap centered at 0.
+    p_abs_max = float(np.max(np.abs(p))) if p.size > 0 else 0.0
+
+    # --- Deutsch ---
+    # Gemeinsame Normierung für alle Plots, die p zeigen:
+    # - Wenn p_abs_max == 0 ist (alles 0), vermeiden wir TwoSlopeNorm-Probleme.
+    #
+    # --- English ---
+    # Shared normalization for all plots that show p:
+    # - If p_abs_max == 0 (all zeros), we avoid TwoSlopeNorm issues.
+    if p_abs_max > 0.0:
+        norm_p_shared = TwoSlopeNorm(vcenter=0.0, vmin=-p_abs_max, vmax=p_abs_max)
+        sc_p = axs_demo[1].scatter(particles.x, particles.y, c=p, s=45, cmap="coolwarm", norm=norm_p_shared)
+    else:
+        norm_p_shared = None
+        sc_p = axs_demo[1].scatter(particles.x, particles.y, c=p, s=45, cmap="coolwarm", vmin=-1.0, vmax=1.0)
     cbar_p = fig_demo.colorbar(sc_p, ax=axs_demo[1])
-    cbar_p.set_label("demo pressure p_demo (unclamped)")
+    cbar_p.set_label("pressure p (unclamped, can be negative)")
     axs_demo[1].set_aspect("equal", adjustable="box")
-    axs_demo[1].set_title("Demo pressure p_demo (color, unclamped)")
+    axs_demo[1].set_title("Pressure p (color, unclamped)")
     axs_demo[1].set_xlabel("x")
     axs_demo[1].set_ylabel("y")
     axs_demo[1].grid(True, alpha=0.3)
@@ -1983,10 +2393,10 @@ def run_learning_viz(
     axs_demo[1].text(
         0.02,
         0.98,
-        "min(p_demo_raw) = {mn}\nmax(p_demo_raw) = {mx}\n\nPressure reacts to density deviation from rho0\n\nrho0_demo = {r0}\nk = {k}".format(
-            mn=f"{float(np.min(p_demo_raw)):.12g}",
-            mx=f"{float(np.max(p_demo_raw)):.12g}",
-            r0=f"{float(rho0_demo):.12g}",
+        "min(p) = {mn}\nmax(p) = {mx}\n\nPressure is proportional to drho: p = k * drho\n\nrho0_ref = {r0}\nk = {k}".format(
+            mn=f"{float(np.min(p)):.12g}",
+            mx=f"{float(np.max(p)):.12g}",
+            r0=f"{float(rho0_ref):.12g}",
             k=f"{float(k):.12g}",
         ),
         transform=axs_demo[1].transAxes,
@@ -2002,8 +2412,12 @@ def run_learning_viz(
     # --- English ---
     # drho can be positive/negative → we use a diverging colormap centered at 0.
     drho_abs_max = float(np.max(np.abs(drho))) if drho.size > 0 else 0.0
-    norm_drho = TwoSlopeNorm(vcenter=0.0, vmin=-drho_abs_max, vmax=drho_abs_max)
-    sc_drho = axs_demo[2].scatter(particles.x, particles.y, c=drho, s=45, cmap="coolwarm", norm=norm_drho)
+    if drho_abs_max > 0.0:
+        norm_drho_shared = TwoSlopeNorm(vcenter=0.0, vmin=-drho_abs_max, vmax=drho_abs_max)
+        sc_drho = axs_demo[2].scatter(particles.x, particles.y, c=drho, s=45, cmap="coolwarm", norm=norm_drho_shared)
+    else:
+        norm_drho_shared = None
+        sc_drho = axs_demo[2].scatter(particles.x, particles.y, c=drho, s=45, cmap="coolwarm", vmin=-1.0, vmax=1.0)
     cbar_drho = fig_demo.colorbar(sc_drho, ax=axs_demo[2])
     cbar_drho.set_label("density deviation drho = rho - mean(rho)")
     axs_demo[2].set_aspect("equal", adjustable="box")
@@ -2032,10 +2446,10 @@ def run_learning_viz(
     axs_demo[2].text(
         0.02,
         0.98,
-        "min(drho) = {mn}\nmax(drho) = {mx}\n\nrho0_demo = {r0}\nk = {k}".format(
+        "min(drho) = {mn}\nmax(drho) = {mx}\n\nrho0_ref = {r0}\nk = {k}".format(
             mn=f"{float(np.min(drho)):.12g}",
             mx=f"{float(np.max(drho)):.12g}",
-            r0=f"{float(rho0_demo):.12g}",
+            r0=f"{float(rho0_ref):.12g}",
             k=f"{float(k):.12g}",
         ),
         transform=axs_demo[2].transAxes,
@@ -2048,21 +2462,21 @@ def run_learning_viz(
     # --- Deutsch ---
     # Fokus-Info (kleine, direkte Zahlenwerte) als zusätzliche Textbox "beim Fokus-Partikel":
     # - rho_focus
-    # - p_demo_focus
+    # - p_focus
     # - drho_focus
     #
     # --- English ---
     # Focus info (small, direct numeric values) as an additional textbox "near the focus particle":
     # - rho_focus
-    # - p_demo_focus
+    # - p_focus
     # - drho_focus
-    rho_focus = float(rho_for_pressure[int(focus_index)])
-    p_demo_focus = float(p_demo_raw[int(focus_index)])
+    rho_focus = float(rho[int(focus_index)])
+    p_focus = float(p[int(focus_index)])
     drho_focus = float(drho[int(focus_index)])
     axs_demo[0].annotate(
         "rho_focus = {r}\n"
-        "p_demo_focus = {p}\n"
-        "drho_focus = {d}".format(r=f"{rho_focus:.12g}", p=f"{p_demo_focus:.12g}", d=f"{drho_focus:.12g}"),
+        "p_focus = {p}\n"
+        "drho_focus = {d}".format(r=f"{rho_focus:.12g}", p=f"{p_focus:.12g}", d=f"{drho_focus:.12g}"),
         xy=(float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])),
         xytext=(12, 12),
         textcoords="offset points",
@@ -2073,7 +2487,7 @@ def run_learning_viz(
         arrowprops={"arrowstyle": "->", "color": "tab:red", "alpha": 0.6, "linewidth": 1.0},
     )
 
-    fig_demo.suptitle("SPH Demo: density, demo pressure, density deviation", fontsize=14, y=0.98)
+    fig_demo.suptitle("SPH Demo: density, pressure, density deviation", fontsize=14, y=0.98)
     fig_demo.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
 
     # --- Deutsch ---
@@ -2106,9 +2520,17 @@ def run_learning_viz(
     # --- English ---
     # For the EOS plot figure we show the unclamped demo pressure
     # so negative values (at low density) become visible.
-    p_abs_max2 = float(np.max(np.abs(p_demo_raw))) if p_demo_raw.size > 0 else 0.0
-    norm_p2 = TwoSlopeNorm(vcenter=0.0, vmin=-p_abs_max2, vmax=p_abs_max2)
-    sc_p2 = axs_p[0].scatter(particles.x, particles.y, c=p_demo_raw, s=45, cmap="coolwarm", norm=norm_p2)
+    # --- Deutsch ---
+    # Wir nutzen dieselbe Normierung wie im vorherigen p-Plot,
+    # damit "rot/blau" in allen Figuren exakt dieselbe Bedeutung hat.
+    #
+    # --- English ---
+    # We reuse the same normalization as in the previous p plot
+    # so that "red/blue" means the exact same values across all figures.
+    if "norm_p_shared" in locals() and norm_p_shared is not None:
+        sc_p2 = axs_p[0].scatter(particles.x, particles.y, c=p, s=45, cmap="coolwarm", norm=norm_p_shared)
+    else:
+        sc_p2 = axs_p[0].scatter(particles.x, particles.y, c=p, s=45, cmap="coolwarm", vmin=-1.0, vmax=1.0)
     cbar_p2 = fig_p.colorbar(sc_p2, ax=axs_p[0])
     cbar_p2.set_label("pressure p (demo, unclamped)")
     axs_p[0].set_aspect("equal", adjustable="box")
@@ -2137,9 +2559,9 @@ def run_learning_viz(
     axs_p[0].text(
         0.02,
         0.98,
-        "min(p_demo_raw) = {mn}\nmax(p_demo_raw) = {mx}\n\nPressure reacts to density deviation from rho0".format(
-            mn=f"{float(np.min(p_demo_raw)):.12g}",
-            mx=f"{float(np.max(p_demo_raw)):.12g}",
+        "min(p) = {mn}\nmax(p) = {mx}\n\nPressure is proportional to drho: p = k * drho".format(
+            mn=f"{float(np.min(p)):.12g}",
+            mx=f"{float(np.max(p)):.12g}",
         ),
         transform=axs_p[0].transAxes,
         ha="left",
@@ -2153,7 +2575,7 @@ def run_learning_viz(
     #
     # --- English ---
     # Scatter: each particle is one point (rho_i, p_i).
-    axs_p[1].scatter(rho_for_pressure, p_demo_raw, s=35, alpha=0.85, color="tab:blue")
+    axs_p[1].scatter(rho, p, s=35, alpha=0.85, color="tab:blue")
     axs_p[1].set_title("EOS: rho → p")
     axs_p[1].set_xlabel("rho")
     axs_p[1].set_ylabel("pressure p")
@@ -2162,9 +2584,9 @@ def run_learning_viz(
     axs_p[1].text(
         0.02,
         0.98,
-        "rho0 = {rho0}\n"
+        "rho0_ref = {rho0}\n"
         "k = {k}\n\n"
-        "EOS maps density error to pressure".format(rho0=f"{float(rho0):.12g}", k=f"{float(k):.12g}"),
+        "EOS maps density error to pressure".format(rho0=f"{float(rho0_ref):.12g}", k=f"{float(k):.12g}"),
         transform=axs_p[1].transAxes,
         ha="left",
         va="top",
@@ -2175,6 +2597,938 @@ def run_learning_viz(
     fig_p.suptitle("SPH Pressure via EOS", fontsize=14, y=0.98)
     fig_p.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
 
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Pipeline-Figure (als letzte Figure): rho → drho → p → a (Pfeile)
+    # -------------------------------------------------------------------------
+    # Diese Figure ist bewusst so gebaut, dass Anfänger die Pipeline direkt sehen:
+    #
+    # Panel 1: drho = rho - rho0_ref (Farben, +/-)
+    # Panel 2: p = k * drho (Farben, +/-)
+    # Panel 3: Beschleunigung a aus Druckunterschieden (Pfeile)
+    #
+    # WICHTIG:
+    # - Alle Panels nutzen exakt dieselben Daten (rho0_ref, drho, p, ax/ay).
+    # - Negative drho → negativer Druck (Unterdruck im Modell).
+    # - Positive drho → positiver Druck (Überdruck im Modell).
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Pipeline figure (as the last figure): rho → drho → p → a (arrows)
+    # -------------------------------------------------------------------------
+    # This figure is intentionally built so beginners can see the pipeline directly:
+    #
+    # Panel 1: drho = rho - rho0_ref (colors, +/-)
+    # Panel 2: p = k * drho (colors, +/-)
+    # Panel 3: acceleration a from pressure differences (arrows)
+    #
+    # IMPORTANT:
+    # - All panels use the exact same data (rho0_ref, drho, p, ax/ay).
+    # - Negative drho → negative pressure (suction in this model).
+    # - Positive drho → positive pressure (over-pressure in this model).
+    fig_pipe, axs_pipe = plt.subplots(1, 3, figsize=(18, 6))
+
+    # --- Deutsch ---
+    # Fokuswerte (für alle Textboxen konsistent):
+    #
+    # --- English ---
+    # Focus values (consistent for all textboxes):
+    rho_focus = float(rho[int(focus_index)])
+    drho_focus = float(drho[int(focus_index)])
+    p_focus = float(p[int(focus_index)])
+    a_focus = float(np.sqrt(float(ax_pressure[int(focus_index)]) ** 2 + float(ay_pressure[int(focus_index)]) ** 2))
+
+    # --- Deutsch ---
+    # Normierungen (diverging colormap, Zentrum bei 0):
+    #
+    # --- English ---
+    # Normalizations (diverging colormap, centered at 0):
+    if drho_abs_max > 0.0:
+        norm_drho_pipe = norm_drho_shared
+    else:
+        norm_drho_pipe = None
+    if p_abs_max > 0.0:
+        norm_p_pipe = norm_p_shared
+    else:
+        norm_p_pipe = None
+
+    # --- Deutsch ---
+    # Panel 1: drho
+    #
+    # --- English ---
+    # Panel 1: drho
+    if norm_drho_pipe is not None:
+        sc1 = axs_pipe[0].scatter(particles.x, particles.y, c=drho, s=40, cmap="coolwarm", norm=norm_drho_pipe)
+    else:
+        sc1 = axs_pipe[0].scatter(particles.x, particles.y, c=drho, s=40, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+    cbar1 = fig_pipe.colorbar(sc1, ax=axs_pipe[0])
+    cbar1.set_label("drho = rho - rho0_ref")
+    axs_pipe[0].scatter([float(particles.x[int(focus_index)])], [float(particles.y[int(focus_index)])], s=150, c="tab:red", zorder=5)
+    axs_pipe[0].add_patch(
+        Circle((float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])), radius=float(h), fill=False, color="tab:red", linewidth=1.6, alpha=0.7, zorder=4)
+    )
+    axs_pipe[0].set_title("drho on particles")
+    axs_pipe[0].set_xlabel("x")
+    axs_pipe[0].set_ylabel("y")
+    axs_pipe[0].grid(True, alpha=0.25)
+    axs_pipe[0].text(
+        0.02,
+        0.98,
+        "min/max drho = {mn} / {mx}\n"
+        "rho_focus = {rf}\n"
+        "drho_focus = {df}\n"
+        "p_focus = {pf}\n"
+        "|a_focus| = {af}".format(
+            mn=f"{float(drho_min):.12g}",
+            mx=f"{float(drho_max):.12g}",
+            rf=f"{float(rho_focus):.12g}",
+            df=f"{float(drho_focus):.12g}",
+            pf=f"{float(p_focus):.12g}",
+            af=f"{float(a_focus):.12g}",
+        ),
+        transform=axs_pipe[0].transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # Panel 2: p
+    #
+    # --- English ---
+    # Panel 2: p
+    if norm_p_pipe is not None:
+        sc2 = axs_pipe[1].scatter(particles.x, particles.y, c=p, s=40, cmap="coolwarm", norm=norm_p_pipe)
+    else:
+        sc2 = axs_pipe[1].scatter(particles.x, particles.y, c=p, s=40, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+    cbar2 = fig_pipe.colorbar(sc2, ax=axs_pipe[1])
+    cbar2.set_label("pressure p = k * drho (can be negative)")
+    axs_pipe[1].scatter([float(particles.x[int(focus_index)])], [float(particles.y[int(focus_index)])], s=150, c="tab:red", zorder=5)
+    axs_pipe[1].add_patch(
+        Circle((float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])), radius=float(h), fill=False, color="tab:red", linewidth=1.6, alpha=0.7, zorder=4)
+    )
+    axs_pipe[1].set_title("pressure p on particles")
+    axs_pipe[1].set_xlabel("x")
+    axs_pipe[1].set_ylabel("y")
+    axs_pipe[1].grid(True, alpha=0.25)
+    axs_pipe[1].text(
+        0.02,
+        0.98,
+        "min/max p = {mn} / {mx}\n"
+        "k = {k}\n"
+        "rho0_ref = {r0}\n\n"
+        "rho_focus = {rf}\n"
+        "drho_focus = {df}\n"
+        "p_focus = {pf}\n"
+        "|a_focus| = {af}".format(
+            mn=f"{float(p_min):.12g}",
+            mx=f"{float(p_max):.12g}",
+            k=f"{float(k):.6g}",
+            r0=f"{float(rho0_ref):.12g}",
+            rf=f"{float(rho_focus):.12g}",
+            df=f"{float(drho_focus):.12g}",
+            pf=f"{float(p_focus):.12g}",
+            af=f"{float(a_focus):.12g}",
+        ),
+        transform=axs_pipe[1].transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # Panel 3: Pfeile (Beschleunigung)
+    #
+    # Regeln:
+    # - Wenn N <= 400: Pfeile für alle Partikel.
+    # - Sonst: nur Fokus + Nachbarn (damit es nicht zu voll wird).
+    #
+    # Pfeile sichtbar machen:
+    # - Wir skalieren rein visuell, damit der größte Pfeil ungefähr Länge 0.25 hat.
+    #
+    # --- English ---
+    # Panel 3: arrows (acceleration)
+    #
+    # Rules:
+    # - If N <= 400: arrows for all particles.
+    # - Otherwise: focus + neighbors only (to avoid clutter).
+    #
+    # Make arrows visible:
+    # - We scale purely visually so the largest arrow has roughly length 0.25.
+    if a_mag_max > 0.0:
+        arrow_mult_pipe = 0.25 / float(a_mag_max)
+    else:
+        arrow_mult_pipe = 1.0
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # TEIL A: Pfeillängen normieren (Richtung bleibt physikalisch korrekt)
+    # -------------------------------------------------------------------------
+    # Problem (für Anfänger verwirrend):
+    # - Wenn wir Pfeile proportional zu |a| zeichnen, können sie am Rand sehr lang wirken
+    #   (Randartefakte) und sich stark überlagern.
+    #
+    # Lösung (nur Visualisierung, keine Physikänderung):
+    # - Wir berechnen zuerst den Betrag:
+    #
+    #     a_mag = sqrt(ax^2 + ay^2)
+    #
+    # - Dann normieren wir die Pfeile relativ zum Maximum:
+    #
+    #     ax_plot = ax / (a_mag.max() + 1e-12)
+    #     ay_plot = ay / (a_mag.max() + 1e-12)
+    #
+    # Wichtig:
+    # - Die Richtung der Pfeile ist physikalisch relevant (zeigt Beschleunigungsrichtung).
+    # - Die Länge ist hier NUR skaliert/normiert, um das Bild ruhig und lesbar zu machen.
+    # - Den absoluten Betrag |a| zeigen wir separat als Zahl (Textbox).
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # PART A: normalize arrow lengths (direction stays physically correct)
+    # -------------------------------------------------------------------------
+    # Problem (confusing for beginners):
+    # - If we draw arrows proportional to |a|, they can look very long near boundaries
+    #   (boundary artifacts) and heavily overlap.
+    #
+    # Solution (visualization only, no physics change):
+    # - First compute the magnitude:
+    #
+    #     a_mag = sqrt(ax^2 + ay^2)
+    #
+    # - Then normalize arrows relative to the maximum:
+    #
+    #     ax_plot = ax / (a_mag.max() + 1e-12)
+    #     ay_plot = ay / (a_mag.max() + 1e-12)
+    #
+    # Important:
+    # - Arrow direction is physically relevant (shows acceleration direction).
+    # - Arrow length is scaled/normalized here ONLY to keep the figure calm and readable.
+    # - We show the absolute magnitude |a| separately as a number (textbox).
+    a_mag_pipe = np.sqrt(ax_pressure * ax_pressure + ay_pressure * ay_pressure)
+    a_mag_max_pipe = float(np.max(a_mag_pipe)) if a_mag_pipe.size > 0 else 0.0
+    denom_pipe = float(a_mag_max_pipe) + 1e-12
+    ax_plot = ax_pressure / denom_pipe
+    ay_plot = ay_pressure / denom_pipe
+
+    # --- Deutsch ---
+    # Wir setzen eine moderate Ziellänge für den größten Pfeil (nur Optik).
+    #
+    # --- English ---
+    # We set a moderate target length for the largest arrow (visual only).
+    arrow_len = 0.20
+
+    if N <= 400:
+        idx_draw = np.arange(N, dtype=np.int64)
+    else:
+        idx_draw = np.asarray(sorted(set(int(j) for j in true_neighbors_including_self)), dtype=np.int64)
+        if idx_draw.size == 0:
+            idx_draw = np.asarray([int(focus_index)], dtype=np.int64)
+
+    axs_pipe[2].scatter(particles.x, particles.y, s=18, c="lightgray", zorder=1)
+    axs_pipe[2].quiver(
+        particles.x[idx_draw],
+        particles.y[idx_draw],
+        ax_plot[idx_draw] * float(arrow_len),
+        ay_plot[idx_draw] * float(arrow_len),
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        color="tab:blue",
+        alpha=0.9,
+        width=0.0045,
+        headwidth=5.5,
+        headlength=7.5,
+        headaxislength=6.5,
+        zorder=2,
+    )
+    axs_pipe[2].quiver(
+        [float(particles.x[int(focus_index)])],
+        [float(particles.y[int(focus_index)])],
+        [float(ax_plot[int(focus_index)]) * float(arrow_len)],
+        [float(ay_plot[int(focus_index)]) * float(arrow_len)],
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        color="tab:purple",
+        alpha=1.0,
+        width=0.010,
+        headwidth=7.0,
+        headlength=9.0,
+        headaxislength=8.0,
+        zorder=3,
+    )
+    axs_pipe[2].scatter([float(particles.x[int(focus_index)])], [float(particles.y[int(focus_index)])], s=150, c="tab:red", zorder=5)
+    axs_pipe[2].add_patch(
+        Circle((float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])), radius=float(h), fill=False, color="tab:red", linewidth=1.6, alpha=0.7, zorder=4)
+    )
+    axs_pipe[2].set_title("pressure acceleration (arrows)", pad=16)
+    axs_pipe[2].set_xlabel("x")
+    axs_pipe[2].set_ylabel("y")
+    axs_pipe[2].grid(True, alpha=0.25)
+    accel_box_text = axs_pipe[2].text(
+        0.02,
+        0.98,
+        "max(|a|) = {amax}\n"
+        "arrows drawn = {n}\n\n"
+        "rho_focus = {rf}\n"
+        "drho_focus = {df}\n"
+        "p_focus = {pf}\n"
+        "|a_focus| = {af}\n\n"
+        "DE:\n"
+        "|a| = Betrag der Beschleunigung\n"
+        "Pfeillänge ist skaliert/normiert (nicht absolut)\n"
+        "max(|a|) wird oben numerisch angegeben\n\n"
+        "EN:\n"
+        "|a| = magnitude of acceleration\n"
+        "arrow length is scaled/normalized (not absolute)\n"
+        "max(|a|) is shown numerically above".format(
+            amax=f"{float(a_mag_max):.12g}",
+            n=int(idx_draw.size),
+            rf=f"{float(rho_focus):.12g}",
+            df=f"{float(drho_focus):.12g}",
+            pf=f"{float(p_focus):.12g}",
+            af=f"{float(a_focus):.12g}",
+        ),
+        transform=axs_pipe[2].transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # TEIL C + D: Rand-Disclaimer + didaktische Klarstellung (gut sichtbar)
+    # -------------------------------------------------------------------------
+    # Warum sieht es am Rand "komisch" aus?
+    # - Dieses Demo nutzt KEINE Randbedingungen (keine Wände, keine Ghost-Particles).
+    # - Am Rand fehlen Nachbarn → Summen/Gradienten werden einseitig → Randartefakte sind erwartbar.
+    #
+    # Was zeigen die Pfeile?
+    # - Pfeile zeigen die resultierende Beschleunigung a an jedem Partikel.
+    # - Sie zeigen NICHT einzelne Nachbarbeiträge.
+    # - Viele Nachbarn zusammen können zu scheinbar kontra-intuitiven Richtungen führen.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # PART C + D: boundary disclaimer + didactic clarification (clearly visible)
+    # -------------------------------------------------------------------------
+    # Why can it look "weird" near boundaries?
+    # - This demo uses NO boundary conditions (no walls, no ghost particles).
+    # - Near boundaries neighbors are missing → sums/gradients become one-sided → boundary artifacts are expected.
+    #
+    # What do the arrows show?
+    # - Arrows show the resulting acceleration a at each particle.
+    # - They do NOT represent individual neighbor force contributions.
+    # - Many neighbors together can create counter-intuitive directions.
+    fig_pipe.text(
+        0.015,
+        0.985,
+        "DE:\n"
+        "Hinweis:\n"
+        "Dieses Demo verwendet keine Randbedingungen (keine Wände, keine Ghost-Particles).\n"
+        "Die gezeigten Pfeile an Rändern und Ecken entstehen durch fehlende Nachbarn\n"
+        "und sind erwartete SPH-Randartefakte.\n"
+        "Randbedingungen werden in einem späteren Schritt ergänzt.\n\n"
+        "Pfeile zeigen die resultierende Beschleunigung.\n"
+        "Sie zeigen nicht einzelne Nachbarbeiträge.\n"
+        "Mehrere Nachbarn können zu scheinbar widersprüchlichen Richtungen führen.\n\n"
+        "EN:\n"
+        "Note:\n"
+        "This demo uses no boundary conditions (no walls, no ghost particles).\n"
+        "Arrows near boundaries and corners result from missing neighbors\n"
+        "and are expected SPH boundary artifacts.\n"
+        "Boundary conditions will be added in a later step.\n\n"
+        "Arrows show the resulting acceleration.\n"
+        "They do not represent individual neighbor forces.\n"
+        "Multiple neighbors can create counter-intuitive directions.",
+        ha="left",
+        va="top",
+        fontsize=9.0,
+        wrap=True,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.92},
+        zorder=100,
+    )
+
+    fig_pipe.suptitle(
+        "DE: Pipeline: rho → drho = rho - rho0_ref → p = k*drho → a(p, rho, ∇W)\n"
+        "DE: Negative drho → negativer Druck (Unterdruck im Modell). Positive drho → positiver Druck.\n\n"
+        "EN: Pipeline: rho → drho = rho - rho0_ref → p = k*drho → a(p, rho, ∇W)\n"
+        "EN: Negative drho produces negative pressure (in this model). Positive drho produces positive pressure.",
+        fontsize=12,
+        x=0.67,
+        y=0.985,
+    )
+    # --- Deutsch ---
+    # Wir reservieren oben Platz für die Disclaimer-Textbox (sonst kann sie sich mit dem Titel überlappen).
+    #
+    # --- English ---
+    # We reserve space at the top for the disclaimer textbox (otherwise it can overlap with the title).
+    fig_pipe.tight_layout(rect=[0.0, 0.0, 1.0, 0.78])
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Textbox für "pressure acceleration" außerhalb des Diagramms platzieren
+    # -------------------------------------------------------------------------
+    # Ziel:
+    # - Die Box soll NICHT über den Pfeilen oder dem Fokus liegen.
+    # - Sie soll oberhalb der Achse stehen, direkt über der Überschrift/Title des Panels.
+    #
+    # Technischer Trick:
+    # - Wir erzeugen die Textbox zuerst "normal" (wie die anderen Panels).
+    # - Danach, NACH tight_layout (wenn die Achsenposition final ist), verschieben wir sie
+    #   in Figure-Koordinaten knapp oberhalb der Achse.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Place the "pressure acceleration" textbox outside the diagram
+    # -------------------------------------------------------------------------
+    # Goal:
+    # - The box should NOT cover arrows or the focus particle.
+    # - It should sit above the axis, directly above the panel title.
+    #
+    # Technical trick:
+    # - We first create the textbox "normally" (like other panels).
+    # - Then, AFTER tight_layout (when the axis position is final), we move it into
+    #   figure coordinates slightly above the axis.
+    ax2_pos = axs_pipe[2].get_position()
+    accel_box_text.set_transform(fig_pipe.transFigure)
+    accel_box_text.set_position((float(ax2_pos.x0) + 0.5 * float(ax2_pos.width), float(ax2_pos.y1) + 0.045))
+    accel_box_text.set_ha("center")
+    accel_box_text.set_va("bottom")
+    accel_box_text.set_clip_on(False)
+    accel_box_text.set_zorder(200)
+
+    # --- Deutsch ---
+    # =========================================================================
+    # Mini-Simulation (nur Vorher/Nachher, keine Echtzeit-Animation)
+    # =========================================================================
+    # Ziel:
+    # - Wir wollen den kompletten "Loop" einmal didaktisch sichtbar machen:
+    #
+    #     rho → p → a → Integration
+    #
+    # - Danach zeigen wir nur:
+    #   (a) Startpositionen (hell) und
+    #   (b) Endpositionen (kräftig)
+    #   Optional: Trajektorie des Fokus-Partikels.
+    #
+    # WICHTIGER DISCLAIMER (für Anfänger):
+    # - Keine Randbedingungen (keine Wände, keine Ghost-Particles) → Randartefakte sind normal.
+    # - Keine Viskosität → es fehlt “Dämpfung”, daher kann Bewegung “hart” wirken.
+    # - Nur Demonstration: keine garantierte Stabilität oder physikalische Vollständigkeit.
+    #
+    # --- English ---
+    # =========================================================================
+    # Mini simulation (before/after only, no real-time animation)
+    # =========================================================================
+    # Goal:
+    # - We want to show the full "loop" once in a didactic way:
+    #
+    #     rho → p → a → integration
+    #
+    # - After that we show only:
+    #   (a) start positions (faint) and
+    #   (b) end positions (strong)
+    #   Optional: trajectory of the focus particle.
+    #
+    # IMPORTANT DISCLAIMER (for beginners):
+    # - No boundary conditions (no walls, no ghost particles) → boundary artifacts are normal.
+    # - No viscosity → there is no “damping”, so motion can feel “harsh”.
+    # - Demonstration only: no guarantee of stability or full physical completeness.
+    N = particles.n
+    x_start = particles.x.copy()
+    y_start = particles.y.copy()
+
+    # --- Deutsch ---
+    # Wir simulieren auf einer eigenen Kopie, damit die bisherigen Plots unverändert bleiben.
+    #
+    # --- English ---
+    # We simulate on our own copy so the existing plots remain unchanged.
+    sim_particles = ParticleSet2D(
+        x=x_start.copy(),
+        y=y_start.copy(),
+        vx=particles.vx.copy(),
+        vy=particles.vy.copy(),
+        rho=np.zeros(N, dtype=np.float64),
+        p=np.zeros(N, dtype=np.float64),
+        m=particles.m.copy(),
+    )
+
+    focus_x_traj: list[float] = [float(sim_particles.x[int(focus_index)])]
+    focus_y_traj: list[float] = [float(sim_particles.y[int(focus_index)])]
+    traj_stride = max(1, int(int(n_steps) // 200))
+
+    # --- Deutsch ---
+    # Für “sichtbaren” Druck wählen wir einen Referenzwert rho0_ref_sim aus dem Startzustand:
+    # - Wenn das Gitter sehr symmetrisch ist, kann rho fast konstant sein.
+    # - Dann ist drho = rho - rho0_ref_sim fast 0 → p ~ 0 → a ~ 0 → keine Bewegung.
+    # - Für die Demo nehmen wir rho0_ref_sim = mean(rho_init).
+    #
+    # WICHTIG:
+    # - Wir nutzen im Simulationsloop absichtlich **signed pressure** (ohne clamp),
+    #   damit man auch Unterdruck/Überdruck sehen kann.
+    #
+    # --- English ---
+    # For “visible” pressure we choose a reference rho0_ref_sim from the initial state:
+    # - If the grid is very symmetric, rho can be almost constant.
+    # - Then drho = rho - rho0_ref_sim is almost 0 → p ~ 0 → a ~ 0 → no motion.
+    # - For the demo we use rho0_ref_sim = mean(rho_init).
+    #
+    # IMPORTANT:
+    # - In the simulation loop we intentionally use **signed pressure** (no clamp),
+    #   so you can see negative/positive pressure.
+    if compute_density_grid is not None:
+        rho_init = compute_density_grid(particles=sim_particles, h=float(h), cell_size=float(h))
+    else:
+        rho_init = compute_density_naive(particles=sim_particles, h=float(h))
+    rho0_ref_sim = float(np.mean(rho_init))
+
+    # --- Deutsch ---
+    # Kleine, kontrollierte Asymmetrie (NUR fürs Demo):
+    # - Wir verschieben genau EIN Partikel minimal.
+    # - Das bricht perfekte Symmetrie, damit sich Kräfte nicht komplett ausgleichen.
+    #
+    # Hinweis:
+    # - Wir verändern die echten Partikel nicht, nur `sim_particles` (Demo-Kopie).
+    #
+    # --- English ---
+    # Small, controlled asymmetry (DEMO ONLY):
+    # - We shift exactly ONE particle by a tiny amount.
+    # - This breaks perfect symmetry so forces do not cancel out completely.
+    #
+    # Note:
+    # - We do not modify the real particles, only `sim_particles` (demo copy).
+    sim_particles.x[0] += 0.02 * float(dx)
+
+    ax_last = np.zeros(N, dtype=np.float64)
+    ay_last = np.zeros(N, dtype=np.float64)
+    p_last = np.zeros(N, dtype=np.float64)
+    a_mag_max_first = 0.0
+
+    for _step in range(int(n_steps)):
+        if compute_density_grid is not None:
+            rho_step = compute_density_grid(particles=sim_particles, h=float(h), cell_size=float(h))
+        else:
+            rho_step = compute_density_naive(particles=sim_particles, h=float(h))
+
+        # --- Deutsch ---
+        # drho und p konsistent aus demselben Referenzwert rho0_ref_sim:
+        # - drho = rho - rho0_ref_sim
+        # - p = k * drho   (signed, ohne clamp)
+        #
+        # Warum ohne clamp?
+        # - Für die Demo wollen wir Unterdruck (negativ) und Überdruck (positiv) sehen.
+        #
+        # --- English ---
+        # drho and p consistent from the same reference value rho0_ref_sim:
+        # - drho = rho - rho0_ref_sim
+        # - p = k * drho   (signed, no clamp)
+        #
+        # Why no clamp?
+        # - For the demo we want to see negative pressure (under-pressure) and positive pressure.
+        drho_step = np.asarray(rho_step, dtype=np.float64) - float(rho0_ref_sim)
+        p_step = compute_pressure_eos(rho=rho_step, rho0=float(rho0_ref_sim), k=float(k), clamp_negative=False)
+
+        ax_step, ay_step = compute_pressure_acceleration(
+            particles=sim_particles,
+            rho=rho_step,
+            p=p_step,
+            h=float(h),
+            cell_size=float(h),
+        )
+
+        if int(_step) == 0:
+            a_mag = np.sqrt(np.asarray(ax_step, dtype=np.float64) ** 2 + np.asarray(ay_step, dtype=np.float64) ** 2)
+            a_mag_max_first = float(np.max(a_mag)) if a_mag.size > 0 else 0.0
+
+        # --- Deutsch ---
+        # Integration: v += a*dt, dann x += v*dt (Semi-Implicit Euler).
+        #
+        # --- English ---
+        # Integration: v += a*dt, then x += v*dt (semi-implicit Euler).
+        step_semi_implicit_euler(particles=sim_particles, ax=ax_step, ay=ay_step, dt=float(dt))
+
+        # --- Deutsch ---
+        # Optionale, sehr einfache Dämpfung (nur Demo):
+        # - Wir reduzieren v leicht pro Schritt.
+        # - Das ist "Demo stabilization; not physical viscosity".
+        #
+        # --- English ---
+        # Optional, very simple damping (demo only):
+        # - We reduce v slightly per step.
+        # - This is "demo stabilization; not physical viscosity".
+        if float(damping) > 0.0:
+            sim_particles.vx *= (1.0 - float(damping))
+            sim_particles.vy *= (1.0 - float(damping))
+
+        # --- Deutsch ---
+        # Trajektorie nur fürs Fokus-Partikel, und maximal ~200 Punkte:
+        # - Wir speichern nur jeden `traj_stride`-ten Schritt.
+        #
+        # --- English ---
+        # Trajectory only for the focus particle, and max ~200 points:
+        # - We store only every `traj_stride`-th step.
+        if bool(show_focus_trajectory) and (int(_step) % int(traj_stride) == 0):
+            focus_x_traj.append(float(sim_particles.x[int(focus_index)]))
+            focus_y_traj.append(float(sim_particles.y[int(focus_index)]))
+
+        ax_last = np.asarray(ax_step, dtype=np.float64)
+        ay_last = np.asarray(ay_step, dtype=np.float64)
+        p_last = np.asarray(p_step, dtype=np.float64)
+
+    x_end = sim_particles.x.copy()
+    y_end = sim_particles.y.copy()
+
+    # --- Deutsch ---
+    # Debug-Metriken (pro Run):
+    # - max(|a|) im ersten Schritt: wenn das ~0 ist, ist keine Bewegung möglich.
+    # - max(|v|) am Ende
+    # - max(|dx|) am Ende (maximale Positionsänderung)
+    #
+    # --- English ---
+    # Debug metrics (per run):
+    # - max(|a|) in the first step: if that is ~0, no motion is possible.
+    # - max(|v|) at the end
+    # - max(|dx|) at the end (maximum position change)
+    v_mag_end = np.sqrt(sim_particles.vx * sim_particles.vx + sim_particles.vy * sim_particles.vy)
+    v_mag_max_end = float(np.max(v_mag_end)) if v_mag_end.size > 0 else 0.0
+    disp = np.sqrt((x_end - x_start) ** 2 + (y_end - y_start) ** 2)
+    disp_max = float(np.max(disp)) if disp.size > 0 else 0.0
+
+    # --- Deutsch ---
+    # Neue finale Figure: Start vs End (keine Animation).
+    #
+    # --- English ---
+    # New final figure: start vs end (no animation).
+    fig_sim, ax_sim = plt.subplots(1, 1, figsize=(8.0, 6.5))
+    ax_sim.set_title("mini simulation: start vs end (rho → p → a → integration)")
+    ax_sim.set_xlabel("x")
+    ax_sim.set_ylabel("y")
+    ax_sim.set_aspect("equal", adjustable="box")
+    ax_sim.grid(True, alpha=0.25)
+
+    # --- Deutsch ---
+    # Startpositionen (klar getrennt von "Ende"):
+    # - Wir zeichnen Start als graue, hohle Marker.
+    # - Dadurch sieht man sofort: "Hohl = Start".
+    #
+    # --- English ---
+    # Start positions (clearly separated from "end"):
+    # - We draw start as gray, hollow markers.
+    # - This makes it immediately clear: "hollow = start".
+    start_sc = ax_sim.scatter(
+        x_start,
+        y_start,
+        s=26,
+        facecolors="none",
+        edgecolors="gray",
+        linewidths=0.9,
+        alpha=0.35,
+        label="start",
+        zorder=1,
+    )
+
+    # --- Deutsch ---
+    # Optional: Bewegungsvektoren (nur wenn es nicht überlädt).
+    # - Wenn N <= 200: wir zeichnen für alle Partikel eine dünne Linie von Start → Ende.
+    # - Wenn N groß ist: nur Fokus + (falls vorhanden) seine Nachbarn.
+    #
+    # --- English ---
+    # Optional: motion vectors (only if it does not clutter).
+    # - If N <= 200: draw a thin line for all particles from start → end.
+    # - If N is large: only focus + (if available) its neighbors.
+    idx_motion: np.ndarray
+    if int(N) <= 200:
+        idx_motion = np.arange(int(N), dtype=np.int64)
+    else:
+        if "true_neighbors_including_self" in locals():
+            idx_motion = np.asarray(sorted(set(int(j) for j in true_neighbors_including_self)), dtype=np.int64)
+            if idx_motion.size == 0:
+                idx_motion = np.asarray([int(focus_index)], dtype=np.int64)
+        else:
+            idx_motion = np.asarray([int(focus_index)], dtype=np.int64)
+
+    for i in idx_motion:
+        ii = int(i)
+        ax_sim.plot(
+            [float(x_start[ii]), float(x_end[ii])],
+            [float(y_start[ii]), float(y_end[ii])],
+            color="gray",
+            alpha=0.15,
+            linewidth=0.8,
+            zorder=2,
+        )
+
+    # --- Deutsch ---
+    # Endpositionen: kräftiger (hier farbig nach p, damit man “Druckfeld” sieht).
+    #
+    # --- English ---
+    # End positions: stronger (colored by p here so you can see a “pressure field”).
+    # --- Deutsch ---
+    # Endpositionen: kräftiger (farbig nach p, damit man die Druckverteilung erkennt).
+    # Wir nutzen eine Diverging-Farbskala um 0, weil p hier signed ist.
+    #
+    # --- English ---
+    # End positions: stronger (colored by p so you can see the pressure field).
+    # We use a diverging color scale around 0 because p is signed here.
+    p_min_end = float(np.min(p_last)) if p_last.size > 0 else 0.0
+    p_max_end = float(np.max(p_last)) if p_last.size > 0 else 0.0
+    if p_min_end < 0.0 < p_max_end:
+        norm_p_end = TwoSlopeNorm(vmin=p_min_end, vcenter=0.0, vmax=p_max_end)
+    else:
+        norm_p_end = None
+
+    if norm_p_end is not None:
+        sc_end = ax_sim.scatter(
+            x_end,
+            y_end,
+            s=30,
+            c=p_last,
+            cmap="coolwarm",
+            norm=norm_p_end,
+            alpha=0.85,
+            label="end (colored by pressure)",
+            zorder=4,
+        )
+    else:
+        sc_end = ax_sim.scatter(
+            x_end,
+            y_end,
+            s=30,
+            c=p_last,
+            cmap="coolwarm",
+            alpha=0.85,
+            label="end (colored by pressure)",
+            zorder=4,
+        )
+    cbar_end = fig_sim.colorbar(sc_end, ax=ax_sim)
+    cbar_end.set_label("pressure p (demo)")
+
+    # --- Deutsch ---
+    # Fokus-Partikel: Bewegung explizit sichtbar machen
+    # - Start: kleines schwarzes "x"
+    # - Ende: großer roter Stern
+    # - Pfeil: zeigt integrierte Bewegung Start → Ende über n_steps
+    #
+    # --- English ---
+    # Focus particle: make motion explicitly visible
+    # - Start: small black "x"
+    # - End: large red star
+    # - Arrow: shows integrated motion start → end over n_steps
+    x_focus_start = float(x_start[int(focus_index)])
+    y_focus_start = float(y_start[int(focus_index)])
+    x_focus_end = float(x_end[int(focus_index)])
+    y_focus_end = float(y_end[int(focus_index)])
+    dx_focus = float(np.sqrt((x_focus_end - x_focus_start) ** 2 + (y_focus_end - y_focus_start) ** 2))
+
+    ax_sim.scatter(
+        [x_focus_start],
+        [y_focus_start],
+        s=70,
+        c="black",
+        marker="x",
+        linewidths=2.0,
+        alpha=0.9,
+        label="_nolegend_",
+        zorder=5,
+    )
+    ax_sim.scatter(
+        [x_focus_end],
+        [y_focus_end],
+        s=160,
+        c="tab:red",
+        marker="*",
+        alpha=1.0,
+        label="_nolegend_",
+        zorder=7,
+    )
+    ax_sim.annotate(
+        "",
+        xy=(x_focus_end, y_focus_end),
+        xytext=(x_focus_start, y_focus_start),
+        arrowprops={"arrowstyle": "->", "color": "tab:red", "lw": 2.0, "alpha": 0.9},
+        zorder=6,
+    )
+
+    # --- Deutsch ---
+    # Optional: Trajektorie des Fokus-Partikels als Linie (falls aktiviert).
+    #
+    # --- English ---
+    # Optional: focus particle trajectory as a line (if enabled).
+    if bool(show_focus_trajectory):
+        ax_sim.plot(focus_x_traj, focus_y_traj, color="tab:red", linewidth=1.6, alpha=0.75, label="_nolegend_", zorder=3)
+
+    # --- Deutsch ---
+    # Disclaimer-Textbox (kurz, klar).
+    #
+    # --- English ---
+    # Disclaimer textbox (short, clear).
+    ax_sim.text(
+        0.02,
+        0.98,
+        "DE:\n"
+        f"dt = {float(dt):.6g}\n"
+        f"n_steps = {int(n_steps)}\n"
+        f"k = {float(k):.6g}\n"
+        f"damping = {float(damping):.6g}\n"
+        f"max(|dx|) Ende = {disp_max:.6g}\n\n"
+        "Start = hohl grau, Ende = farbig (Druck)\n\n"
+        "Hinweis:\n"
+        "- keine Randbedingungen\n"
+        "- keine Viskosität\n"
+        "- keine Stabilisierung (außer demo damping)\n"
+        "- Bewegung dient nur der Demonstration der Pipeline\n\n"
+        "EN:\n"
+        f"dt = {float(dt):.6g}\n"
+        f"n_steps = {int(n_steps)}\n"
+        f"k = {float(k):.6g}\n"
+        f"damping = {float(damping):.6g}\n"
+        f"max(|dx|) end = {disp_max:.6g}\n\n"
+        "Start = hollow gray, End = colored (pressure)\n\n"
+        "Note:\n"
+        "- no boundary conditions\n"
+        "- no viscosity\n"
+        "- no stabilization (except demo damping)\n"
+        "- motion is only to demonstrate the pipeline",
+        transform=ax_sim.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.92},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # Fokus-Textbox: dx_focus macht die integrierte Bewegung über n_steps direkt als Zahl sichtbar.
+    #
+    # --- English ---
+    # Focus textbox: dx_focus makes the integrated motion over n_steps visible as a number.
+    ax_sim.text(
+        0.98,
+        0.02,
+        "DE:\n"
+        f"dx_focus = {dx_focus:.6g}\n"
+        "Das zeigt die integrierte Bewegung über n_steps.\n\n"
+        "EN:\n"
+        f"dx_focus = {dx_focus:.6g}\n"
+        "This shows the integrated motion over n_steps.",
+        transform=ax_sim.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.92},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # Debug-Textbox: erklärt, warum ggf. keine Bewegung sichtbar ist.
+    #
+    # --- English ---
+    # Debug textbox: explains why motion may not be visible.
+    ax_sim.text(
+        0.02,
+        0.02,
+        "DE:\n"
+        f"max(|a|) Schritt 0 = {a_mag_max_first:.6g}\n"
+        f"max(|v|) Ende     = {v_mag_max_end:.6g}\n"
+        f"max(|dx|) Ende    = {disp_max:.6g}\n"
+        "Wenn |a|≈0, dann kann es keine Bewegung geben.\n\n"
+        "EN:\n"
+        f"max(|a|) step 0   = {a_mag_max_first:.6g}\n"
+        f"max(|v|) end      = {v_mag_max_end:.6g}\n"
+        f"max(|dx|) end     = {disp_max:.6g}\n"
+        "If |a|≈0, there cannot be any motion.",
+        transform=ax_sim.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.92},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # Kleine Legende, die die Start/Ende-Kodierung erklärt (DE/EN blockweise).
+    #
+    # --- English ---
+    # Small legend that explains the start/end encoding (DE/EN block-wise).
+    leg = ax_sim.legend(
+        handles=[start_sc, sc_end],
+        loc="lower left",
+        fontsize=9,
+        framealpha=0.9,
+        title="DE:\nstart = hohl grau\nende = farbig (Druck)\n\nEN:\nstart = hollow gray\nend = colored (pressure)",
+        title_fontsize=9,
+    )
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Alle Diagramme "verknüpfen": gleiche Achsen + gemeinsame Zoom/Pan-Ansicht
+    # -------------------------------------------------------------------------
+    # Ziel:
+    # - Alle Plots, die Partikel in x/y zeigen, sollen:
+    #   (1) dieselben Achsen-Limits haben (direkt vergleichbar)
+    #   (2) beim Zoomen/Pannen synchron bleiben (miteinander verknüpft)
+    #
+    # Umsetzung:
+    # - Wir berechnen gemeinsame xlim/ylim aus denselben Daten (particles.x/y, Fokus, h, dx).
+    # - Wir setzen diese Limits auf alle Partikel-Achsen.
+    # - Wir verbinden die Achsen über Callbacks (funktioniert auch über mehrere Figures).
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # "Link" all diagrams: same axes + shared zoom/pan view
+    # -------------------------------------------------------------------------
+    # Goal:
+    # - All plots that show particles in x/y should:
+    #   (1) use the same axis limits (directly comparable)
+    #   (2) stay synchronized when zooming/panning (linked together)
+    #
+    # Implementation:
+    # - Compute shared xlim/ylim from the same data (particles.x/y, focus, h, dx).
+    # - Apply those limits to all particle axes.
+    # - Link axes via callbacks (works across multiple figures).
+    xlim_shared, ylim_shared = _compute_shared_xy_limits(
+        particles.x,
+        particles.y,
+        focus_index=int(focus_index),
+        h=float(h),
+        dx=float(dx),
+    )
+
+    axes_to_link = [
+        # Haupt-Plot: Partikel + Dichte
+        axs[0],
+        axs[2],
+        # Vergleich: naive/grid/diff
+        axs_cmp[0],
+        axs_cmp[1],
+        axs_cmp[2],
+        # Demo: rho/p/drho als x/y Scatter
+        axs_demo[0],
+        axs_demo[1],
+        axs_demo[2],
+        # Pressure-Figure: Druckkarte (x/y), EOS-Scatter NICHT (rho->p)
+        axs_p[0],
+        # Pipeline-Figure: drho / p / Pfeile
+        axs_pipe[0],
+        axs_pipe[1],
+        axs_pipe[2],
+        # Mini-Simulation: Start vs End (x/y)
+        ax_sim,
+    ]
+
+    for ax_link in axes_to_link:
+        _apply_shared_xy_limits(ax_link, xlim=xlim_shared, ylim=ylim_shared)
+
+    _link_xy_axes(axes_to_link)
+
 
     # --- Deutsch ---
     # Anzeigen (kein File-I/O, keine Prints)
@@ -2184,7 +3538,884 @@ def run_learning_viz(
     plt.show()
 
 
+def run_learning_viz_animation(
+    L: float = 1.0,
+    dx: float = 0.1,
+    h: float | None = None,
+    k: float = 25.0,
+    dt: float = 0.001,
+    steps_per_frame: int = 5,
+    n_frames: int = 400,
+    damping: float = 0.02,
+    focus_index: int = 0,
+) -> None:
+    """
+    DE:
+    Live-Demo-Animation: Partikel + Druckbeschleunigungs-Pfeile werden pro Frame aktualisiert.
+
+    Ziel (Didaktik):
+    --------------
+    Anfänger sollen sofort sehen, was passiert:
+    - Partikel bewegen sich, weil wir pro Zeitschritt integrieren.
+    - Pfeile zeigen die Beschleunigungsrichtung (aus Druckkräften).
+    - Die Pfeillänge ist für die Darstellung skaliert, nicht absolut.
+
+    Pipeline pro Simulationsschritt:
+    -------------------------------
+    1) rho berechnen (grid preferred, fallback naive)
+    2) rho0_ref = mean(rho)  (Demo-Referenz)
+    3) drho = rho - rho0_ref
+    4) p = k * drho (signed, clamp_negative=False)
+    5) (ax, ay) aus Druckkräften berechnen
+    6) integrieren (Semi-Implicit Euler)
+    7) Demo-Dämpfung auf v anwenden (Stabilisierung nur fürs Demo)
+
+    Wichtige Disclaimer:
+    --------------------
+    - Keine Randbedingungen (keine Wände, keine Ghost-Particles) → Randartefakte sind normal.
+    - Keine echte Viskosität → wir fügen keine physikalische Dämpfungskraft hinzu.
+    - Die optionale Dämpfung hier ist NUR “Demo stabilization; not physical viscosity”.
+
+    EN:
+    Live demo animation: particles + pressure-acceleration arrows update each frame.
+
+    Goal (teaching):
+    Beginners should immediately see what is happening:
+    - Particles move because we integrate each time step.
+    - Arrows show acceleration direction (from pressure forces).
+    - Arrow length is scaled for visualization, not absolute.
+
+    Pipeline per simulation step:
+    1) compute rho (grid preferred, fallback naive)
+    2) rho0_ref = mean(rho)  (demo reference)
+    3) drho = rho - rho0_ref
+    4) p = k * drho (signed, clamp_negative=False)
+    5) compute (ax, ay) from pressure forces
+    6) integrate (semi-implicit Euler)
+    7) apply demo damping to v (stabilization for demo only)
+
+    Important disclaimers:
+    - No boundary conditions (no walls, no ghost particles) → boundary artifacts are normal.
+    - No real viscosity → we do not add a physical damping force.
+    - The optional damping here is ONLY “demo stabilization; not physical viscosity”.
+    """
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Eingaben validieren (frühe, klare Fehler)
+    # -------------------------------------------------------------------------
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Validate inputs (early, clear errors)
+    # -------------------------------------------------------------------------
+    _validate_positive("L", float(L))
+    _validate_positive("dx", float(dx))
+    _validate_positive("k", float(k))
+    _validate_positive("dt", float(dt))
+    if int(steps_per_frame) <= 0:
+        raise ValueError("steps_per_frame muss > 0 sein.")
+    if int(n_frames) <= 0:
+        raise ValueError("n_frames muss > 0 sein.")
+    if float(damping) < 0.0 or float(damping) >= 1.0:
+        raise ValueError("damping muss in [0, 1) liegen.")
+
+    # --- Deutsch ---
+    # Wenn h nicht gegeben ist: didaktischer Default h = 1.5*dx.
+    #
+    # --- English ---
+    # If h is not provided: didactic default h = 1.5*dx.
+    if h is None:
+        h_used = 1.5 * float(dx)
+    else:
+        h_used = float(h)
+    _validate_positive("h", float(h_used))
+
+    # --- Deutsch ---
+    # Partikel erzeugen (Demo-Parameter für rho0 und Masse):
+    # - rho0=1000.0 (Wasser als typischer Referenzwert)
+    #
+    # Demo-Massenabschätzung (2D):
+    # - In 2D ist eine einfache, plausible Masse pro Partikel:
+    #
+    #     m = rho0 * dx * dx
+    #
+    #   Interpretation:
+    #   - Jede Zelle im Gitter hat Fläche dx*dx.
+    #   - rho0 ist eine Referenzdichte.
+    #   - m ist dann eine grobe "Masse pro Partikel" für sinnvollere Skalen.
+    #
+    # WICHTIG:
+    # - Das ist nur Demo-Skalierung.
+    # - Es ist keine perfekte physikalische Kalibrierung.
+    #
+    # --- English ---
+    # Create particles (demo parameters for rho0 and mass):
+    # - rho0=1000.0 (water as a typical reference value)
+    #
+    # Demo mass estimate (2D):
+    # - In 2D, a simple, plausible mass per particle is:
+    #
+    #     m = rho0 * dx * dx
+    #
+    # Interpretation:
+    # - Each grid cell has area dx*dx.
+    # - rho0 is a reference density.
+    # - m is then a rough "mass per particle" for more reasonable scales.
+    #
+    # IMPORTANT:
+    # - This is demo scaling only.
+    # - It is not a perfect physical calibration.
+    rho0_demo = 1000.0
+    m_demo = float(rho0_demo) * float(dx) * float(dx)
+    particles = initialize_particles_cube(L=float(L), dx=float(dx), rho0=float(rho0_demo), mass_per_particle=float(m_demo))
+    N = particles.n
+
+    # --- Deutsch ---
+    # Fokus-Index robust machen (anfängerfreundlich).
+    #
+    # --- English ---
+    # Make focus index robust (beginner-friendly).
+    if int(focus_index) < 0 or int(focus_index) >= int(N):
+        focus_index = 0
+
+    # --- Deutsch ---
+    # Startpositionen merken (für max(|dx|) seit Start).
+    #
+    # --- English ---
+    # Store start positions (for max(|dx|) since start).
+    x0 = particles.x.copy()
+    y0 = particles.y.copy()
+
+    # --- Deutsch ---
+    # Wir halten die "letzten" a-Werte für die Visualisierung.
+    #
+    # --- English ---
+    # We keep the "latest" a values for visualization.
+    ax_last = np.zeros(N, dtype=np.float64)
+    ay_last = np.zeros(N, dtype=np.float64)
+
+    # --- Deutsch ---
+    # Figure/Axes (ein Diagramm):
+    # - Scatter: Partikel
+    # - Quiver: Beschleunigungsrichtung (skaliert)
+    #
+    # --- English ---
+    # Figure/axes (single plot):
+    # - Scatter: particles
+    # - Quiver: acceleration direction (scaled)
+    fig, ax = plt.subplots(1, 1, figsize=(8.5, 7.0))
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("SPH demo animation: particles + pressure acceleration (scaled arrows)")
+    ax.grid(True, alpha=0.25)
+
+    pad = 0.05 * float(L)
+    ax.set_xlim(-pad, float(L) + pad)
+    ax.set_ylim(-pad, float(L) + pad)
+
+    # --- Deutsch ---
+    # Scatter: wir erstellen ihn einmal und updaten nur die Offsets.
+    #
+    # --- English ---
+    # Scatter: create once and only update offsets.
+    scat = ax.scatter(particles.x, particles.y, s=24, c="tab:blue", alpha=0.85, zorder=2)
+
+    # --- Deutsch ---
+    # Fokus-Partikel markieren (extra Marker).
+    #
+    # --- English ---
+    # Mark focus particle (extra marker).
+    focus_scat = ax.scatter(
+        [float(particles.x[int(focus_index)])],
+        [float(particles.y[int(focus_index)])],
+        s=140,
+        c="tab:red",
+        marker="*",
+        zorder=5,
+        label="focus",
+    )
+
+    # --- Deutsch ---
+    # Quiver: initial (noch keine Beschleunigung, also 0).
+    #
+    # WICHTIG (Didaktik):
+    # - Wir normalisieren Pfeile später pro Frame:
+    #   ax_plot = ax/(max(|a|)+eps), damit Richtung klar sichtbar bleibt.
+    #
+    # --- English ---
+    # Quiver: initial (no acceleration yet, so 0).
+    #
+    # IMPORTANT (teaching):
+    # - We normalize arrows per frame:
+    #   ax_plot = ax/(max(|a|)+eps), so direction stays clearly visible.
+    arrow_len = 0.25 * float(dx)
+    quiv = ax.quiver(
+        particles.x,
+        particles.y,
+        np.zeros(N, dtype=np.float64),
+        np.zeros(N, dtype=np.float64),
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        color="tab:purple",
+        alpha=0.75,
+        width=0.0035,
+        zorder=3,
+    )
+
+    # --- Deutsch ---
+    # Statische Disclaimer-Textbox (bleibt gleich).
+    #
+    # --- English ---
+    # Static disclaimer textbox (does not change).
+    disclaimer_text = ax.text(
+        0.02,
+        0.98,
+        "DE:\n"
+        "Demo-Animation: Druckkräfte aus EOS + Spiky-Gradient.\n"
+        "Hinweis: Keine Randbedingungen (keine Wände/Ghost-Particles), keine echte Viskosität, nur Demo.\n"
+        "Pfeile zeigen Beschleunigungsrichtung; Länge ist skaliert.\n\n"
+        "EN:\n"
+        "Demo animation: pressure forces from EOS + spiky gradient.\n"
+        "Note: no boundary conditions (no walls/ghost particles), no real viscosity, demo only.\n"
+        "Arrows show acceleration direction; length is scaled.",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.92},
+        zorder=10,
+    )
+
+    # --- Deutsch ---
+    # Debug-Textbox (wird pro Frame aktualisiert).
+    #
+    # --- English ---
+    # Debug textbox (updated each frame).
+    debug_text = ax.text(
+        0.02,
+        0.02,
+        "DE:\nframe = 0\nmax(|a|)=0\nmax(|v|)=0\nmax(|dx|)=0\n\nEN:\nframe = 0\nmax(|a|)=0\nmax(|v|)=0\nmax(|dx|)=0",
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.92},
+        zorder=10,
+    )
+
+    def _one_sim_step() -> tuple[np.ndarray, np.ndarray]:
+        """
+        DE:
+        Führe genau EINEN Simulationsschritt aus und gib (ax, ay) zurück.
+
+        EN:
+        Perform exactly ONE simulation step and return (ax, ay).
+        """
+
+        # --- Deutsch ---
+        # 1) Dichte rho berechnen (Grid bevorzugt).
+        #
+        # --- English ---
+        # 1) Compute density rho (prefer grid).
+        if compute_density_grid is not None:
+            rho = compute_density_grid(particles=particles, h=float(h_used), cell_size=float(h_used))
+        else:
+            rho = compute_density_naive(particles=particles, h=float(h_used))
+
+        # --- Deutsch ---
+        # 2) Demo-Referenz rho0_ref: Mittelwert.
+        #
+        # --- English ---
+        # 2) Demo reference rho0_ref: mean.
+        rho0_ref = float(np.mean(rho)) if rho.size > 0 else 0.0
+
+        # --- Deutsch ---
+        # 3) drho und 4) Druck p (signed, ohne clamp).
+        #
+        # --- English ---
+        # 3) drho and 4) pressure p (signed, no clamp).
+        drho = rho - rho0_ref
+        p = compute_pressure_eos(rho=rho, rho0=float(rho0_ref), k=float(k), clamp_negative=False)
+
+        # --- Deutsch ---
+        # 5) Druckbeschleunigung berechnen.
+        #
+        # --- English ---
+        # 5) Compute pressure acceleration.
+        ax_step, ay_step = compute_pressure_acceleration(
+            particles=particles,
+            rho=rho,
+            p=p,
+            h=float(h_used),
+            cell_size=float(h_used),
+        )
+
+        # --- Deutsch ---
+        # 6) Integration.
+        #
+        # --- English ---
+        # 6) Integration.
+        step_semi_implicit_euler(particles=particles, ax=ax_step, ay=ay_step, dt=float(dt))
+
+        # --- Deutsch ---
+        # 7) Demo-Dämpfung (Stabilisierung nur fürs Demo, KEINE physikalische Viskosität).
+        #
+        # --- English ---
+        # 7) Demo damping (demo stabilization only, NOT physical viscosity).
+        if float(damping) > 0.0:
+            particles.vx *= (1.0 - float(damping))
+            particles.vy *= (1.0 - float(damping))
+
+        return np.asarray(ax_step, dtype=np.float64), np.asarray(ay_step, dtype=np.float64)
+
+    def update(frame: int):
+        """
+        DE:
+        Matplotlib-Callback pro Frame.
+        Wir führen `steps_per_frame` Simulationsschritte aus und aktualisieren dann die Artists.
+
+        EN:
+        Matplotlib callback per frame.
+        We perform `steps_per_frame` simulation steps and then update the artists.
+        """
+
+        nonlocal ax_last, ay_last
+
+        for _ in range(int(steps_per_frame)):
+            ax_last, ay_last = _one_sim_step()
+
+        # --- Deutsch ---
+        # Scatter Offsets updaten.
+        #
+        # --- English ---
+        # Update scatter offsets.
+        scat.set_offsets(np.column_stack([particles.x, particles.y]))
+        focus_scat.set_offsets(np.array([[float(particles.x[int(focus_index)]), float(particles.y[int(focus_index)])]]))
+
+        # --- Deutsch ---
+        # --- Deutsch ---
+        # ---------------------------------------------------------------------
+        # Soft-Scaling für Pfeile: Richtung + "etwas" Stärke, aber ruhig lesbar
+        # ---------------------------------------------------------------------
+        # Idee:
+        # - Die Richtung ist physikalisch: sie ist die Beschleunigungsrichtung.
+        # - Die Länge ist für Lesbarkeit skaliert, enthält aber jetzt auch Information über die Stärke.
+        #
+        # Umsetzung:
+        # 1) a_mag = |a|
+        # 2) a_unit = a / (|a| + eps)   → Einheitsvektor (nur Richtung)
+        # 3) a_rel = sqrt(|a| / max(|a|))   → 0..1, aber "weicher"
+        #
+        # Warum sqrt?
+        # - Sehr große Unterschiede (Ausreißer) werden abgemildert.
+        # - Das reduziert “Pfeil-Chaos”, bleibt aber anschaulich.
+        #
+        # --- English ---
+        # ---------------------------------------------------------------------
+        # Soft scaling for arrows: direction + "some" strength, but calmly readable
+        # ---------------------------------------------------------------------
+        # Idea:
+        # - Direction is physical: it is the acceleration direction.
+        # - Length is scaled for readability, but now also carries some information about magnitude.
+        #
+        # Implementation:
+        # 1) a_mag = |a|
+        # 2) a_unit = a / (|a| + eps)       → unit vector (direction only)
+        # 3) a_rel = sqrt(|a| / max(|a|))   → 0..1, but "softer"
+        #
+        # Why sqrt?
+        # - Extreme differences (outliers) are damped.
+        # - This reduces “arrow chaos” while staying intuitive.
+        a_mag = np.sqrt(ax_last * ax_last + ay_last * ay_last)
+        a_mag_max = float(np.max(a_mag)) if a_mag.size > 0 else 0.0
+        a_unit_x = ax_last / (a_mag + 1e-12)
+        a_unit_y = ay_last / (a_mag + 1e-12)
+        a_rel = np.sqrt(a_mag / (float(a_mag_max) + 1e-12))
+
+        quiv.set_offsets(np.column_stack([particles.x, particles.y]))
+        quiv.set_UVC(a_unit_x * float(a_rel) * float(arrow_len), a_unit_y * float(a_rel) * float(arrow_len))
+
+        # --- Deutsch ---
+        # Debug-Metriken:
+        # - max(|a|): aus den aktuellen Beschleunigungen
+        # - max(|v|): aus den aktuellen Geschwindigkeiten
+        # - max(|dx|): maximale Verschiebung seit Start
+        #
+        # --- English ---
+        # Debug metrics:
+        # - max(|a|): from current accelerations
+        # - max(|v|): from current velocities
+        # - max(|dx|): max displacement since start
+        v_mag = np.sqrt(particles.vx * particles.vx + particles.vy * particles.vy)
+        v_mag_max = float(np.max(v_mag)) if v_mag.size > 0 else 0.0
+        disp = np.sqrt((particles.x - x0) ** 2 + (particles.y - y0) ** 2)
+        disp_max = float(np.max(disp)) if disp.size > 0 else 0.0
+
+        debug_text.set_text(
+            "DE:\n"
+            f"frame = {int(frame)}\n"
+            f"max(|a|) = {a_mag_max:.6g}\n"
+            f"max(|v|) = {v_mag_max:.6g}\n"
+            f"max(|dx|) = {disp_max:.6g}\n\n"
+            "EN:\n"
+            f"frame = {int(frame)}\n"
+            f"max(|a|) = {a_mag_max:.6g}\n"
+            f"max(|v|) = {v_mag_max:.6g}\n"
+            f"max(|dx|) = {disp_max:.6g}"
+        )
+
+        # blit=False → Rückgabewert ist optional; wir geben die wichtigsten Artists zurück.
+        return scat, focus_scat, quiv, disclaimer_text, debug_text
+
+    # --- Deutsch ---
+    # Animation starten (looped).
+    #
+    # --- English ---
+    # Start animation (looped).
+    _anim = FuncAnimation(
+        fig,
+        update,
+        frames=int(n_frames),
+        interval=30,
+        blit=False,
+        repeat=True,
+    )
+
+    ax.legend(loc="lower left")
+    plt.show()
+
+
+def run_pressure_force_demo(
+    L: float = 1.0,
+    dx: float = 0.1,
+    h: float | None = None,
+    rho0: float = 1000.0,
+    k: float = 500.0,
+    dt: float = 0.002,
+    num_steps: int = 30,
+    focus_index: int = 0,
+) -> None:
+    """
+    DE:
+    Optionaler Zusatz-Demo-Modus: Druckkräfte (Pressure Forces) wirklich sichtbar machen.
+
+    WICHTIG:
+    - Diese Funktion ist komplett separat von `run_learning_viz()`.
+    - Sie ändert keine bestehenden Plots/Funktionen.
+    - Sie ist absichtlich sehr linear/verständlich geschrieben (Tutorial-Stil).
+
+    Problem-Hintergrund:
+    - Ein perfektes, symmetrisches Partikelgitter kann fast konstante Dichte/Druck erzeugen.
+    - Dann ist der Druckgradient klein und die resultierende Kraft ~0.
+    - Um "Force" zu demonstrieren, brauchen wir:
+      (a) eine kleine Asymmetrie (Perturbation) und
+      (b) mehrere Integrationsschritte, damit Bewegung sichtbar wird.
+
+    Was wir hier machen:
+    1) Wir erzeugen ein Partikelgitter.
+    2) Wir arbeiten auf lokalen Kopien (x,y,vx,vy) → `particles` wird nicht dauerhaft verändert.
+    3) Wir verschieben ein Partikel minimal (Perturbation), um einen Druckgradienten zu erzeugen.
+    4) Wir iterieren `num_steps`:
+       - rho berechnen (Grid bevorzugt, sonst naiv)
+       - p_demo über EOS (geclamped)
+       - Druckbeschleunigung (ax, ay)
+       - explizites Euler: v += a*dt, x += v*dt
+    5) Am Ende zeichnen wir eine ruhige 2-Panel-Figure:
+       - Links: Before vs After (vorher grau, nachher farbig nach p_demo)
+       - Rechts: Pfeile (quiver) für Druckbeschleunigung (letzter Schritt), visuell skaliert
+
+    EN:
+    Optional add-on demo mode: make pressure forces (pressure forces) truly visible.
+
+    IMPORTANT:
+    - This function is completely separate from `run_learning_viz()`.
+    - It does not modify existing plots/functions.
+    - It is intentionally written in a very linear/beginner-friendly style (tutorial style).
+
+    Background problem:
+    - A perfectly symmetric particle grid can produce nearly constant density/pressure.
+    - Then the pressure gradient is tiny and the resulting force is ~0.
+    - To demonstrate "force", we need:
+      (a) a small asymmetry (perturbation) and
+      (b) multiple integration steps so motion becomes visible.
+
+    What we do here:
+    1) Create a particle grid.
+    2) Work on local copies (x,y,vx,vy) → `particles` is not permanently modified.
+    3) Move one particle slightly (perturbation) to create a pressure gradient.
+    4) Iterate `num_steps`:
+       - compute rho (prefer grid, otherwise naive)
+       - compute p_demo via EOS (clamped)
+       - compute pressure acceleration (ax, ay)
+       - explicit Euler: v += a*dt, x += v*dt
+    5) Finally draw a calm 2-panel figure:
+       - Left: before vs after (before gray, after colored by p_demo)
+       - Right: arrows (quiver) for pressure acceleration (last step), visually scaled
+    """
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Eingaben validieren (frühe, klare Fehler)
+    # -------------------------------------------------------------------------
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Validate inputs (early, clear errors)
+    # -------------------------------------------------------------------------
+    _validate_positive("L", float(L))
+    _validate_positive("dx", float(dx))
+    _validate_positive("rho0", float(rho0))
+    _validate_positive("k", float(k))
+    _validate_positive("dt", float(dt))
+    if int(num_steps) <= 0:
+        raise ValueError("num_steps muss > 0 sein.")
+    if float(dx) >= float(L):
+        raise ValueError("dx muss < L sein, sonst entstehen zu wenige Partikel.")
+
+    # --- Deutsch ---
+    # Wenn h nicht gegeben ist, wählen wir einen didaktischen Default:
+    # h = 1.5 * dx (typisch: genügend Nachbarn im Einflussradius).
+    #
+    # --- English ---
+    # If h is not provided, we choose a didactic default:
+    # h = 1.5 * dx (typical: enough neighbors within the influence radius).
+    if h is None:
+        h_used = 1.5 * float(dx)
+    else:
+        h_used = float(h)
+    _validate_positive("h", float(h_used))
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Partikelgitter erzeugen
+    # -------------------------------------------------------------------------
+    # Hinweis:
+    # - `initialize_particles_cube` benötigt auch die Masse pro Partikel.
+    # - Für dieses Demo wählen wir eine feste, kleine Masse.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Create particle grid
+    # -------------------------------------------------------------------------
+    # Note:
+    # - `initialize_particles_cube` also requires the mass per particle.
+    # - For this demo we choose a fixed, small mass.
+    mass_per_particle = 0.01
+    particles = initialize_particles_cube(
+        L=float(L),
+        dx=float(dx),
+        rho0=float(rho0),
+        mass_per_particle=float(mass_per_particle),
+    )
+    N = particles.n
+    if N <= 0:
+        raise ValueError("Es wurden keine Partikel erzeugt (N == 0).")
+
+    # --- Deutsch ---
+    # Fokusindex clampen (anfängerfreundlich):
+    #
+    # --- English ---
+    # Clamp focus index (beginner-friendly):
+    if int(focus_index) < 0 or int(focus_index) >= int(N):
+        focus_index = 0
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Lokale Kopien anlegen (wir verändern `particles` nicht dauerhaft)
+    # -------------------------------------------------------------------------
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Create local copies (we do not permanently modify `particles`)
+    # -------------------------------------------------------------------------
+    x = np.asarray(particles.x, dtype=np.float64).copy()
+    y = np.asarray(particles.y, dtype=np.float64).copy()
+    vx = np.zeros(N, dtype=np.float64)
+    vy = np.zeros(N, dtype=np.float64)
+    m = np.asarray(particles.m, dtype=np.float64).copy()
+
+    # --- Deutsch ---
+    # "Before"-Zustand speichern:
+    #
+    # --- English ---
+    # Save the "before" state:
+    x0 = x.copy()
+    y0 = y.copy()
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Sehr kleine Asymmetrie (Perturbation) nur für das Demo
+    # -------------------------------------------------------------------------
+    # Idee:
+    # - Wir wählen ein Partikel nahe der Mitte (hier: j = N//2 als sehr einfache Wahl).
+    # - Wir verschieben es minimal nach rechts: x[j] += 0.25*dx
+    # - Dadurch entsteht ein kleiner Dichte-/Druckunterschied → Druckgradient → Kraft.
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Very small asymmetry (perturbation) for the demo only
+    # -------------------------------------------------------------------------
+    # Idea:
+    # - We pick a particle near the middle (here: j = N//2 as a very simple choice).
+    # - We shift it slightly to the right: x[j] += 0.25*dx
+    # - This creates a small density/pressure difference → pressure gradient → force.
+    j = int(N // 2)
+    x[j] = float(x[j]) + 0.25 * float(dx)
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Mini-Simulation: mehrere Schritte, damit Bewegung sichtbar wird
+    # -------------------------------------------------------------------------
+    # Wir nutzen explicit Euler (nur Demo):
+    # - v += a * dt
+    # - x += v * dt
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Mini simulation: multiple steps so motion becomes visible
+    # -------------------------------------------------------------------------
+    # We use explicit Euler (demo only):
+    # - v += a * dt
+    # - x += v * dt
+    rho = np.zeros(N, dtype=np.float64)
+    p_demo = np.zeros(N, dtype=np.float64)
+    ax = np.zeros(N, dtype=np.float64)
+    ay = np.zeros(N, dtype=np.float64)
+
+    for _step in range(int(num_steps)):
+        # --- Deutsch ---
+        # Temporäres ParticleSet2D bauen:
+        # - Wichtig: Wir geben unsere lokalen Arrays hinein.
+        # - rho/p in diesem Objekt sind "Dummy" und werden NICHT verwendet.
+        #
+        # --- English ---
+        # Build a temporary ParticleSet2D:
+        # - Important: we pass in our local arrays.
+        # - rho/p in this object are "dummy" and are NOT used.
+        temp_particles = ParticleSet2D(
+            x=x,
+            y=y,
+            vx=vx,
+            vy=vy,
+            rho=np.zeros(N, dtype=np.float64),
+            p=np.zeros(N, dtype=np.float64),
+            m=m,
+        )
+
+        # --- Deutsch ---
+        # Dichte berechnen (Grid bevorzugt, sonst naiv):
+        #
+        # --- English ---
+        # Compute density (prefer grid, otherwise naive):
+        if compute_density_grid is not None:
+            rho = compute_density_grid(particles=temp_particles, h=float(h_used), cell_size=float(h_used))
+        else:
+            rho = compute_density_naive(particles=temp_particles, h=float(h_used))
+
+        # --- Deutsch ---
+        # Demo-Referenzdichte:
+        # - Wir setzen rho0_demo leicht unter mean(rho), damit p_demo (geclamped) nicht überall 0 ist.
+        #
+        # --- English ---
+        # Demo reference density:
+        # - We set rho0_demo slightly below mean(rho) so clamped p_demo is not all zeros.
+        rho0_demo = float(np.mean(rho) * 0.95) if rho.size > 0 else 0.0
+
+        # --- Deutsch ---
+        # Druck über EOS (geclamped):
+        #
+        # --- English ---
+        # Pressure via EOS (clamped):
+        p_demo = compute_pressure_eos(rho=rho, rho0=float(rho0_demo), k=float(k), clamp_negative=True)
+
+        # --- Deutsch ---
+        # Druckbeschleunigung (Kräfte) berechnen:
+        #
+        # --- English ---
+        # Compute pressure acceleration (forces):
+        ax, ay = compute_pressure_acceleration(
+            particles=temp_particles,
+            rho=rho,
+            p=p_demo,
+            h=float(h_used),
+            cell_size=float(h_used),
+        )
+
+        # --- Deutsch ---
+        # Euler-Integration:
+        #
+        # --- English ---
+        # Euler integration:
+        vx = vx + ax * float(dt)
+        vy = vy + ay * float(dt)
+        x = x + vx * float(dt)
+        y = y + vy * float(dt)
+
+    # --- Deutsch ---
+    # Diagnosewerte für die Textbox:
+    #
+    # --- English ---
+    # Diagnostic values for the textbox:
+    rho_min = float(np.min(rho)) if rho.size > 0 else 0.0
+    rho_max = float(np.max(rho)) if rho.size > 0 else 0.0
+    p_min = float(np.min(p_demo)) if p_demo.size > 0 else 0.0
+    p_max = float(np.max(p_demo)) if p_demo.size > 0 else 0.0
+
+    a_mag = np.sqrt(ax * ax + ay * ay)
+    a_mag_max = float(np.max(a_mag)) if a_mag.size > 0 else 0.0
+
+    disp = np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
+    disp_max = float(np.max(disp)) if disp.size > 0 else 0.0
+
+    # --- Deutsch ---
+    # Pfeile sichtbar machen (nur Visualisierung):
+    # - Wir skalieren so, dass der größte Pfeil ungefähr Länge 0.15 im Plot hat.
+    #
+    # --- English ---
+    # Make arrows visible (visualization only):
+    # - We scale so the largest arrow has roughly length 0.15 in plot units.
+    if a_mag_max > 0.0:
+        arrow_mult = 0.15 / float(a_mag_max)
+    else:
+        arrow_mult = 1.0
+
+    # --- Deutsch ---
+    # -------------------------------------------------------------------------
+    # Plot: eine ruhige 2-Panel-Figure
+    # -------------------------------------------------------------------------
+    #
+    # --- English ---
+    # -------------------------------------------------------------------------
+    # Plot: one calm 2-panel figure
+    # -------------------------------------------------------------------------
+    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- Deutsch ---
+    # Links: Before vs After
+    #
+    # --- English ---
+    # Left: before vs after
+    axs[0].scatter(x0, y0, s=22, c="lightgray", label="before", zorder=1)
+    sc_after = axs[0].scatter(x, y, s=30, c=p_demo, cmap="viridis", label="after (colored by p_demo)", zorder=2)
+    cbar = fig.colorbar(sc_after, ax=axs[0])
+    cbar.set_label("demo pressure p_demo (clamped)")
+    axs[0].set_aspect("equal", adjustable="box")
+    axs[0].set_title("Pressure force demo: before vs after")
+    axs[0].set_xlabel("x")
+    axs[0].set_ylabel("y")
+    axs[0].grid(True, alpha=0.25)
+    axs[0].legend(loc="best")
+
+    # --- Deutsch ---
+    # Rechts: Pfeile (quiver) für den letzten Schritt
+    #
+    # --- English ---
+    # Right: arrows (quiver) for the last step
+    axs[1].scatter(x, y, s=22, c="lightgray", label="particles", zorder=1)
+
+    if N <= 600:
+        axs[1].quiver(
+            x,
+            y,
+            ax * float(arrow_mult),
+            ay * float(arrow_mult),
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            color="tab:blue",
+            alpha=0.35,
+            width=0.0028,
+            zorder=2,
+        )
+
+    # --- Deutsch ---
+    # Fokus-Pfeil immer zeichnen (Mindestanforderung).
+    #
+    # --- English ---
+    # Always draw the focus arrow (minimum requirement).
+    axs[1].quiver(
+        [float(x[int(focus_index)])],
+        [float(y[int(focus_index)])],
+        [float(ax[int(focus_index)]) * float(arrow_mult)],
+        [float(ay[int(focus_index)]) * float(arrow_mult)],
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        color="tab:purple",
+        alpha=1.0,
+        width=0.006,
+        zorder=3,
+        label="focus force (scaled)",
+    )
+
+    axs[1].set_aspect("equal", adjustable="box")
+    axs[1].set_title("Pressure acceleration (arrows, last step)")
+    axs[1].set_xlabel("x")
+    axs[1].set_ylabel("y")
+    axs[1].grid(True, alpha=0.25)
+    axs[1].legend(loc="best")
+
+    # --- Deutsch ---
+    # Große Diagnose-Textbox (kein Print):
+    #
+    # --- English ---
+    # Large diagnostics textbox (no prints):
+    fig.text(
+        0.02,
+        0.02,
+        "Diagnostics (pressure force demo)\n"
+        "N = {N}\n"
+        "dx = {dx}\n"
+        "h = {h}\n"
+        "dt = {dt}\n"
+        "num_steps = {ns}\n"
+        "rho0 = {rho0}\n"
+        "k = {k}\n\n"
+        "rho min/max = {rmin} / {rmax}\n"
+        "p_demo min/max = {pmin} / {pmax}\n"
+        "max(|a|) = {amax}\n"
+        "max displacement = {dmax}".format(
+            N=int(N),
+            dx=f"{float(dx):.6g}",
+            h=f"{float(h_used):.6g}",
+            dt=f"{float(dt):.6g}",
+            ns=int(num_steps),
+            rho0=f"{float(rho0):.6g}",
+            k=f"{float(k):.6g}",
+            rmin=f"{float(rho_min):.12g}",
+            rmax=f"{float(rho_max):.12g}",
+            pmin=f"{float(p_min):.12g}",
+            pmax=f"{float(p_max):.12g}",
+            amax=f"{float(a_mag_max):.12g}",
+            dmax=f"{float(disp_max):.12g}",
+        ),
+        ha="left",
+        va="bottom",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.92},
+    )
+
+    fig.suptitle("SPH pressure force demo (optional add-on)", fontsize=14, y=0.98)
+    fig.tight_layout(rect=[0.0, 0.08, 1.0, 0.93])
+    plt.show()
+
+
 if __name__ == "__main__":
-    run_learning_viz()
+    run_learning_viz_animation()
+    # --- Deutsch ---
+    # Optional: statische Lern-Visualisierung (ohne Animation).
+    #
+    # --- English ---
+    # Optional: static learning visualization (no animation).
+    # run_learning_viz()
+    # --- Deutsch ---
+    # Optional: separater Zusatz-Demo-Modus für Druckkräfte (ändert `run_learning_viz()` nicht).
+    #
+    # --- English ---
+    # Optional: separate add-on demo mode for pressure forces (does not change `run_learning_viz()`).
+    # run_pressure_force_demo()
 
 
